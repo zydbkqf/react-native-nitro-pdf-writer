@@ -1,0 +1,50 @@
+{
+  "name": "react-native-nitro-pdf-writer",
+  "version": "0.1.0",
+  "description": "Fast PDF file writing for React Native using libHaru and Nitro Modules",
+  "license": "MIT",
+  "homepage": "https://github.com/zydbkqf/react-native-nitro-pdf-writer",
+  "author": "Denis Cheung (https://github.com/zydbkqf)",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "source": "src/index.ts",
+  "scripts": {
+    "postinstall": "node scripts/prepare-libharu.js",
+    "specs": "nitrogen",
+    "test": "jest",
+    "test:cpp": "node scripts/test-cpp.js"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.78.0",
+    "react-native-nitro-modules": ">=0.35.8"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "jest": "^30.4.2",
+    "nitrogen": "*",
+    "react": "*",
+    "react-native": "*",
+    "react-native-nitro-modules": ">=0.35.8",
+    "ts-jest": "^29.4.11",
+    "typescript": "5.4.5"
+  },
+  "files": [
+    "src",
+    "!src/__tests__",
+    "cpp",
+    "!cpp/tests",
+    "android",
+    "ios",
+    "scripts",
+    "Package.swift",
+    "nitro.json",
+    "nitrogen",
+    "NitroPdfWriter.podspec",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "packageManager": "yarn@4.17.1"
+}

@@ -1,0 +1,55 @@
+buildscript {
+  ext.safeExtGet = {prop, fallback ->
+    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+  }
+}
+
+def reactNativeArchitectures() {
+  def value = rootProject.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+  namespace 'com.margelo.nitro.pdfwriter'
+  compileSdk safeExtGet("compileSdkVersion", 34)
+
+  defaultConfig {
+    minSdk safeExtGet("minSdkVersion", 21)
+    externalNativeBuild {
+      cmake {
+        arguments "-DANDROID_STL=c++_shared"
+        abiFilters (*reactNativeArchitectures())
+      }
+    }
+  }
+
+  buildFeatures {
+    buildConfig false
+    prefab true
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  kotlinOptions {
+    jvmTarget = "17"
+  }
+
+  externalNativeBuild {
+    cmake {
+      path file("CMakeLists.txt")
+    }
+  }
+}
+
+dependencies {
+  implementation "com.facebook.react:react-native:+"
+  implementation project(':react-native-nitro-modules')
+}
+
+apply from: "../nitrogen/generated/android/NitroPdfWriter+autolinking.gradle"

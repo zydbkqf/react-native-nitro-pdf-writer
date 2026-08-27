@@ -1,0 +1,198 @@
+#pragma once
+
+#include <hpdf.h>
+#include <hpdf_error.h>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+
+namespace margelo::nitro::pdfwriter {
+
+struct HaruErrorInfo {
+  const char* name;
+  const char* message;
+};
+
+inline std::string haruErrorName(HPDF_STATUS error) {
+  static const std::unordered_map<HPDF_STATUS, const char*> names = {
+      {HPDF_ARRAY_COUNT_ERR, "HPDF_ARRAY_COUNT_ERR"},
+      {HPDF_ARRAY_ITEM_NOT_FOUND, "HPDF_ARRAY_ITEM_NOT_FOUND"},
+      {HPDF_ARRAY_ITEM_UNEXPECTED_TYPE, "HPDF_ARRAY_ITEM_UNEXPECTED_TYPE"},
+      {HPDF_BINARY_LENGTH_ERR, "HPDF_BINARY_LENGTH_ERR"},
+      {HPDF_CANNOT_GET_PALLET, "HPDF_CANNOT_GET_PALLET"},
+      {HPDF_DICT_COUNT_ERR, "HPDF_DICT_COUNT_ERR"},
+      {HPDF_DICT_ITEM_NOT_FOUND, "HPDF_DICT_ITEM_NOT_FOUND"},
+      {HPDF_DICT_ITEM_UNEXPECTED_TYPE, "HPDF_DICT_ITEM_UNEXPECTED_TYPE"},
+      {HPDF_DICT_STREAM_LENGTH_NOT_FOUND, "HPDF_DICT_STREAM_LENGTH_NOT_FOUND"},
+      {HPDF_DOC_ENCRYPTDICT_NOT_FOUND, "HPDF_DOC_ENCRYPTDICT_NOT_FOUND"},
+      {HPDF_DOC_INVALID_OBJECT, "HPDF_DOC_INVALID_OBJECT"},
+      {HPDF_DUPLICATE_REGISTRATION, "HPDF_DUPLICATE_REGISTRATION"},
+      {HPDF_EXCEED_JWW_CODE_NUM_LIMIT, "HPDF_EXCEED_JWW_CODE_NUM_LIMIT"},
+      {HPDF_ENCRYPT_INVALID_PASSWORD, "HPDF_ENCRYPT_INVALID_PASSWORD"},
+      {HPDF_ERR_UNKNOWN_CLASS, "HPDF_ERR_UNKNOWN_CLASS"},
+      {HPDF_EXCEED_GSTATE_LIMIT, "HPDF_EXCEED_GSTATE_LIMIT"},
+      {HPDF_FAILD_TO_ALLOC_MEM, "HPDF_FAILD_TO_ALLOC_MEM"},
+      {HPDF_FILE_IO_ERROR, "HPDF_FILE_IO_ERROR"},
+      {HPDF_FILE_OPEN_ERROR, "HPDF_FILE_OPEN_ERROR"},
+      {HPDF_FONT_EXISTS, "HPDF_FONT_EXISTS"},
+      {HPDF_FONT_INVALID_WIDTHS_TABLE, "HPDF_FONT_INVALID_WIDTHS_TABLE"},
+      {HPDF_INVALID_AFM_HEADER, "HPDF_INVALID_AFM_HEADER"},
+      {HPDF_INVALID_ANNOTATION, "HPDF_INVALID_ANNOTATION"},
+      {HPDF_INVALID_BIT_PER_COMPONENT, "HPDF_INVALID_BIT_PER_COMPONENT"},
+      {HPDF_INVALID_CHAR_MATRICS_DATA, "HPDF_INVALID_CHAR_MATRICS_DATA"},
+      {HPDF_INVALID_COLOR_SPACE, "HPDF_INVALID_COLOR_SPACE"},
+      {HPDF_INVALID_COMPRESSION_MODE, "HPDF_INVALID_COMPRESSION_MODE"},
+      {HPDF_INVALID_DATE_TIME, "HPDF_INVALID_DATE_TIME"},
+      {HPDF_INVALID_DESTINATION, "HPDF_INVALID_DESTINATION"},
+      {HPDF_INVALID_DOCUMENT, "HPDF_INVALID_DOCUMENT"},
+      {HPDF_INVALID_DOCUMENT_STATE, "HPDF_INVALID_DOCUMENT_STATE"},
+      {HPDF_INVALID_ENCODER, "HPDF_INVALID_ENCODER"},
+      {HPDF_INVALID_ENCODER_TYPE, "HPDF_INVALID_ENCODER_TYPE"},
+      {HPDF_INVALID_ENCODING_NAME, "HPDF_INVALID_ENCODING_NAME"},
+      {HPDF_INVALID_ENCRYPT_KEY_LEN, "HPDF_INVALID_ENCRYPT_KEY_LEN"},
+      {HPDF_INVALID_FONTDEF_DATA, "HPDF_INVALID_FONTDEF_DATA"},
+      {HPDF_INVALID_FONTDEF_TYPE, "HPDF_INVALID_FONTDEF_TYPE"},
+      {HPDF_INVALID_FONT_NAME, "HPDF_INVALID_FONT_NAME"},
+      {HPDF_INVALID_IMAGE, "HPDF_INVALID_IMAGE"},
+      {HPDF_INVALID_JPEG_DATA, "HPDF_INVALID_JPEG_DATA"},
+      {HPDF_INVALID_N_DATA, "HPDF_INVALID_N_DATA"},
+      {HPDF_INVALID_OBJECT, "HPDF_INVALID_OBJECT"},
+      {HPDF_INVALID_OBJ_ID, "HPDF_INVALID_OBJ_ID"},
+      {HPDF_INVALID_OPERATION, "HPDF_INVALID_OPERATION"},
+      {HPDF_INVALID_OUTLINE, "HPDF_INVALID_OUTLINE"},
+      {HPDF_INVALID_PAGE, "HPDF_INVALID_PAGE"},
+      {HPDF_INVALID_PAGES, "HPDF_INVALID_PAGES"},
+      {HPDF_INVALID_PARAMETER, "HPDF_INVALID_PARAMETER"},
+      {HPDF_INVALID_PNG_IMAGE, "HPDF_INVALID_PNG_IMAGE"},
+      {HPDF_INVALID_STREAM, "HPDF_INVALID_STREAM"},
+      {HPDF_MISSING_FILE_NAME_ENTRY, "HPDF_MISSING_FILE_NAME_ENTRY"},
+      {HPDF_INVALID_TTC_FILE, "HPDF_INVALID_TTC_FILE"},
+      {HPDF_INVALID_TTC_INDEX, "HPDF_INVALID_TTC_INDEX"},
+      {HPDF_INVALID_WX_DATA, "HPDF_INVALID_WX_DATA"},
+      {HPDF_ITEM_NOT_FOUND, "HPDF_ITEM_NOT_FOUND"},
+      {HPDF_LIBPNG_ERROR, "HPDF_LIBPNG_ERROR"},
+      {HPDF_NAME_INVALID_VALUE, "HPDF_NAME_INVALID_VALUE"},
+      {HPDF_NAME_OUT_OF_RANGE, "HPDF_NAME_OUT_OF_RANGE"},
+      {HPDF_PAGE_INVALID_PARAM_COUNT, "HPDF_PAGE_INVALID_PARAM_COUNT"},
+      {HPDF_PAGES_MISSING_KIDS_ENTRY, "HPDF_PAGES_MISSING_KIDS_ENTRY"},
+      {HPDF_PAGE_CANNOT_FIND_OBJECT, "HPDF_PAGE_CANNOT_FIND_OBJECT"},
+      {HPDF_PAGE_CANNOT_GET_ROOT_PAGES, "HPDF_PAGE_CANNOT_GET_ROOT_PAGES"},
+      {HPDF_PAGE_CANNOT_RESTORE_GSTATE, "HPDF_PAGE_CANNOT_RESTORE_GSTATE"},
+      {HPDF_PAGE_CANNOT_SET_PARENT, "HPDF_PAGE_CANNOT_SET_PARENT"},
+      {HPDF_PAGE_FONT_NOT_FOUND, "HPDF_PAGE_FONT_NOT_FOUND"},
+      {HPDF_PAGE_INVALID_FONT, "HPDF_PAGE_INVALID_FONT"},
+      {HPDF_PAGE_INVALID_FONT_SIZE, "HPDF_PAGE_INVALID_FONT_SIZE"},
+      {HPDF_PAGE_INVALID_GMODE, "HPDF_PAGE_INVALID_GMODE"},
+      {HPDF_PAGE_INVALID_INDEX, "HPDF_PAGE_INVALID_INDEX"},
+      {HPDF_PAGE_INVALID_ROTATE_VALUE, "HPDF_PAGE_INVALID_ROTATE_VALUE"},
+      {HPDF_PAGE_INVALID_SIZE, "HPDF_PAGE_INVALID_SIZE"},
+      {HPDF_PAGE_INVALID_XOBJECT, "HPDF_PAGE_INVALID_XOBJECT"},
+      {HPDF_PAGE_OUT_OF_RANGE, "HPDF_PAGE_OUT_OF_RANGE"},
+      {HPDF_REAL_OUT_OF_RANGE, "HPDF_REAL_OUT_OF_RANGE"},
+      {HPDF_STREAM_EOF, "HPDF_STREAM_EOF"},
+      {HPDF_STREAM_READLN_CONTINUE, "HPDF_STREAM_READLN_CONTINUE"},
+      {HPDF_STRING_OUT_OF_RANGE, "HPDF_STRING_OUT_OF_RANGE"},
+      {HPDF_THIS_FUNC_WAS_SKIPPED, "HPDF_THIS_FUNC_WAS_SKIPPED"},
+      {HPDF_TTF_CANNOT_EMBEDDING_FONT, "HPDF_TTF_CANNOT_EMBEDDING_FONT"},
+      {HPDF_TTF_INVALID_CMAP, "HPDF_TTF_INVALID_CMAP"},
+      {HPDF_TTF_INVALID_FOMAT, "HPDF_TTF_INVALID_FOMAT"},
+      {HPDF_TTF_MISSING_TABLE, "HPDF_TTF_MISSING_TABLE"},
+      {HPDF_UNSUPPORTED_FONT_TYPE, "HPDF_UNSUPPORTED_FONT_TYPE"},
+      {HPDF_UNSUPPORTED_FUNC, "HPDF_UNSUPPORTED_FUNC"},
+      {HPDF_UNSUPPORTED_JPEG_FORMAT, "HPDF_UNSUPPORTED_JPEG_FORMAT"},
+      {HPDF_UNSUPPORTED_TYPE1_FONT, "HPDF_UNSUPPORTED_TYPE1_FONT"},
+      {HPDF_XREF_COUNT_ERR, "HPDF_XREF_COUNT_ERR"},
+      {HPDF_ZLIB_ERROR, "HPDF_ZLIB_ERROR"},
+      {HPDF_INVALID_PAGE_INDEX, "HPDF_INVALID_PAGE_INDEX"},
+      {HPDF_INVALID_URI, "HPDF_INVALID_URI"},
+      {HPDF_PAGE_LAYOUT_OUT_OF_RANGE, "HPDF_PAGE_LAYOUT_OUT_OF_RANGE"},
+      {HPDF_PAGE_MODE_OUT_OF_RANGE, "HPDF_PAGE_MODE_OUT_OF_RANGE"},
+      {HPDF_PAGE_NUM_STYLE_OUT_OF_RANGE, "HPDF_PAGE_NUM_STYLE_OUT_OF_RANGE"},
+      {HPDF_ANNOT_INVALID_ICON, "HPDF_ANNOT_INVALID_ICON"},
+      {HPDF_ANNOT_INVALID_BORDER_STYLE, "HPDF_ANNOT_INVALID_BORDER_STYLE"},
+      {HPDF_PAGE_INVALID_DIRECTION, "HPDF_PAGE_INVALID_DIRECTION"},
+      {HPDF_INVALID_FONT, "HPDF_INVALID_FONT"},
+      {HPDF_PAGE_INSUFFICIENT_SPACE, "HPDF_PAGE_INSUFFICIENT_SPACE"},
+      {HPDF_PAGE_INVALID_DISPLAY_TIME, "HPDF_PAGE_INVALID_DISPLAY_TIME"},
+      {HPDF_PAGE_INVALID_TRANSITION_TIME, "HPDF_PAGE_INVALID_TRANSITION_TIME"},
+      {HPDF_INVALID_PAGE_SLIDESHOW_TYPE, "HPDF_INVALID_PAGE_SLIDESHOW_TYPE"},
+      {HPDF_EXT_GSTATE_OUT_OF_RANGE, "HPDF_EXT_GSTATE_OUT_OF_RANGE"},
+      {HPDF_INVALID_EXT_GSTATE, "HPDF_INVALID_EXT_GSTATE"},
+      {HPDF_EXT_GSTATE_READ_ONLY, "HPDF_EXT_GSTATE_READ_ONLY"},
+      {HPDF_INVALID_U3D_DATA, "HPDF_INVALID_U3D_DATA"},
+      {HPDF_NAME_CANNOT_GET_NAMES, "HPDF_NAME_CANNOT_GET_NAMES"},
+      {HPDF_INVALID_ICC_COMPONENT_NUM, "HPDF_INVALID_ICC_COMPONENT_NUM"},
+      {HPDF_PAGE_INVALID_BOUNDARY, "HPDF_PAGE_INVALID_BOUNDARY"},
+      {HPDF_INVALID_SHADING_TYPE, "HPDF_INVALID_SHADING_TYPE"},
+  };
+
+  auto it = names.find(error);
+  if (it != names.end()) {
+    return it->second;
+  }
+
+  std::ostringstream oss;
+  oss << "UNKNOWN_HPDF_ERROR_0x" << std::hex << error;
+  return oss.str();
+}
+
+inline std::string haruErrorMessage(HPDF_STATUS error) {
+  switch (error) {
+    case HPDF_PAGE_FONT_NOT_FOUND:
+      return "No font is set for the page. Call setFontAndSize() before drawing text.";
+    case HPDF_PAGE_OUT_OF_RANGE:
+      return "A numeric value is out of range. RGB colors must be 0.0-1.0, page sizes 3-14400, etc.";
+    case HPDF_PAGE_INVALID_GMODE:
+      return "The page is in the wrong graphics mode. For example, fill()/stroke() need a path first, "
+             "and textOut() must be between beginText() and endText().";
+    case HPDF_PAGE_INVALID_SIZE:
+      return "Invalid page size. Page width/height must be between 3 and 14400 (PDF units, typically points).";
+    case HPDF_ITEM_NOT_FOUND:
+      return "A required PDF object or item was not found. Often caused by an invalid handle or missing resource.";
+    case HPDF_INVALID_FONT:
+      return "The specified font is invalid or not available.";
+    case HPDF_INVALID_FONT_NAME:
+      return "The font name is invalid or not found in the document.";
+    case HPDF_INVALID_PAGE:
+      return "The page handle is invalid or does not belong to the document.";
+    case HPDF_INVALID_DOCUMENT:
+      return "The document handle is invalid.";
+    case HPDF_FILE_OPEN_ERROR:
+      return "Failed to open the file for writing. Check the path and permissions.";
+    case HPDF_FILE_IO_ERROR:
+      return "Failed to read/write the file. Check disk space and permissions.";
+    case HPDF_INVALID_ENCODER:
+      return "The text encoder is invalid or the encoding is not supported.";
+    case HPDF_INVALID_IMAGE:
+      return "The image format is invalid or unsupported.";
+    case HPDF_LIBPNG_ERROR:
+      return "libpng error while processing a PNG image.";
+    case HPDF_UNSUPPORTED_FUNC:
+      return "This function is not supported in the current configuration.";
+    default:
+      return "libharu PDF operation failed.";
+  }
+}
+
+inline void throwHaruError(HPDF_Doc doc) {
+  HPDF_STATUS error = doc != nullptr ? HPDF_GetError(doc) : HPDF_OK;
+  if (error != HPDF_OK) {
+    HPDF_UINT detail = doc != nullptr ? HPDF_GetErrorDetail(doc) : 0;
+    std::ostringstream message;
+    message << haruErrorName(error) << " (0x" << std::hex << error << ")";
+    message << ": " << haruErrorMessage(error);
+    if (detail != 0) {
+      message << " [detail: " << std::dec << detail << "]";
+    }
+    throw std::runtime_error(message.str());
+  }
+}
+
+inline void throwOnHaruError(HPDF_STATUS status, HPDF_Doc doc) {
+  if (status != HPDF_OK) {
+    throwHaruError(doc);
+  }
+}
+
+} // namespace margelo::nitro::pdfwriter

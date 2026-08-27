@@ -1,0 +1,19 @@
+{
+  "cxxNamespace": ["pdfwriter"],
+  "ios": {
+    "iosModuleName": "NitroPdfWriter"
+  },
+  "android": {
+    "androidNamespace": ["pdfwriter"],
+    "androidCxxLibName": "NitroPdfWriter"
+  },
+  "autolinking": {
+    "NitroPdfWriter": {
+      "all": {
+        "language": "c++",
+        "implementationClassName": "HybridNitroPdfWriter"
+      }
+    }
+  },
+  "ignorePaths": ["node_modules", "lib"]
+}
