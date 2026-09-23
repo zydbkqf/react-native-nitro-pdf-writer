@@ -4,6 +4,7 @@ This software uses third-party open source components listed below, with full li
 ================================================================================
 1. libharu
 Repository: https://github.com/libharu/libharu
+Version: 2.4.6
 License: BSD 2-Clause License (SPDX: BSD-2-Clause)
 Copyright (C) 1999-2006 Takeshi Kanno
 Copyright (C) 2007-2009 Antony Dovgal
@@ -62,8 +63,8 @@ SOFTWARE.
 
 ================================================================================
 3. libpng
-Repository: https://github.com/mrousavy/nitro
-Version: 1.6.43
+Repository: https://github.com/pnggroup/libpng
+Version: 1.6.58
 License: PNG Reference Library License version 2 (SPDX: libpng‑2.0)
 Copyright (c) 1995-2026 The PNG Reference Library Authors.
 Copyright (c) 2018-2026 Cosmin Truta.

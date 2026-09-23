@@ -96,6 +96,7 @@ namespace margelo::nitro::pdfwriter {
       prototype.registerHybridMethod("loadRawImageFromBuffer", &HybridNitroPdfWriterSpec::loadRawImageFromBuffer);
       prototype.registerHybridMethod("setImageMask", &HybridNitroPdfWriterSpec::setImageMask);
       prototype.registerHybridMethod("drawImage", &HybridNitroPdfWriterSpec::drawImage);
+      prototype.registerHybridMethod("drawRawImage", &HybridNitroPdfWriterSpec::drawRawImage);
       prototype.registerHybridMethod("gSave", &HybridNitroPdfWriterSpec::gSave);
       prototype.registerHybridMethod("gRestore", &HybridNitroPdfWriterSpec::gRestore);
       prototype.registerHybridMethod("concat", &HybridNitroPdfWriterSpec::concat);

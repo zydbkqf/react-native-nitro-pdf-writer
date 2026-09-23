@@ -168,6 +168,32 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   ): Promise<number>;
   setImageMask(image: number, mask: number): Promise<void>;
   drawImage(page: number, image: number, x: number, y: number, width: number, height: number): Promise<void>;
+  /**
+   * Convenience: load raw pixel data and draw it onto the page in one call.
+   * Equivalent to loadRawImageFromBuffer() + drawImage() but avoids exposing
+   * the intermediate image handle.
+   *
+   * @param page       Page handle.
+   * @param buffer     Raw pixel data (RGB, RGBA, or grayscale, 8 bits per component).
+   * @param width      Image width in pixels.
+   * @param height     Image height in pixels.
+   * @param colorSpace HPDF_ColorSpace value (e.g. HPDF_CS_DEVICE_RGB = 0).
+   * @param x          X position on the page (PDF points).
+   * @param y          Y position on the page (PDF points).
+   * @param drawWidth  Width to draw on the page (PDF points).
+   * @param drawHeight Height to draw on the page (PDF points).
+   */
+  drawRawImage(
+    page: number,
+    buffer: ArrayBuffer,
+    width: number,
+    height: number,
+    colorSpace: number,
+    x: number,
+    y: number,
+    drawWidth: number,
+    drawHeight: number,
+  ): Promise<void>;
 
   // ---------------------------------------------------------------------------
   // Coordinate transforms

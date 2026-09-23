@@ -154,6 +154,11 @@ public:
   std::shared_ptr<Promise<void>> setImageMask(double image, double mask) override;
   std::shared_ptr<Promise<void>> drawImage(double page, double image, double x, double y,
                                            double width, double height) override;
+  std::shared_ptr<Promise<void>> drawRawImage(double page,
+                                               const std::shared_ptr<ArrayBuffer>& buffer,
+                                               double width, double height, double colorSpace,
+                                               double x, double y,
+                                               double drawWidth, double drawHeight) override;
 
   // Coordinate transforms
   std::shared_ptr<Promise<void>> gSave(double page) override;

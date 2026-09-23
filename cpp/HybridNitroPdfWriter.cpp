@@ -1105,6 +1105,36 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::drawImage(double page, doub
 }
 
 // ---------------------------------------------------------------------------
+// drawRawImage
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Promise<void>> HybridNitroPdfWriter::drawRawImage(double page,
+                                                             const std::shared_ptr<ArrayBuffer>& buffer,
+                                                             double width, double height, double colorSpace,
+                                                             double x, double y,
+                                                             double drawWidth, double drawHeight) {
+  auto promise = Promise<void>::create();
+  HaruWorker::getInstance().run(promise, [this, page, buffer, width, height, colorSpace, x, y, drawWidth, drawHeight]() {
+    std::lock_guard<std::mutex> lock(HaruLock::get());
+    Handle<HPDF_Page> pageH(page, _pages);
+    HPDF_Doc doc = pageH.owner();
+
+    HPDF_Image image = HPDF_LoadRawImageFromMem(doc, buffer->data(),
+                                                static_cast<HPDF_UINT>(width),
+                                                static_cast<HPDF_UINT>(height),
+                                                static_cast<HPDF_ColorSpace>(colorSpace),
+                                                8);
+    throwHaruError(doc);
+
+    throwOnHaruError(HPDF_Page_DrawImage(pageH.get(), image, static_cast<HPDF_REAL>(x),
+                                      static_cast<HPDF_REAL>(y), static_cast<HPDF_REAL>(drawWidth),
+                                      static_cast<HPDF_REAL>(drawHeight)),
+                 doc);
+  });
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
 // Coordinate transforms
 // ---------------------------------------------------------------------------
 

@@ -134,6 +134,7 @@ namespace margelo::nitro::pdfwriter {
       virtual std::shared_ptr<Promise<double>> loadRawImageFromBuffer(double doc, const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, double colorSpace) = 0;
       virtual std::shared_ptr<Promise<void>> setImageMask(double image, double mask) = 0;
       virtual std::shared_ptr<Promise<void>> drawImage(double page, double image, double x, double y, double width, double height) = 0;
+      virtual std::shared_ptr<Promise<void>> drawRawImage(double page, const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, double colorSpace, double x, double y, double drawWidth, double drawHeight) = 0;
       virtual std::shared_ptr<Promise<void>> gSave(double page) = 0;
       virtual std::shared_ptr<Promise<void>> gRestore(double page) = 0;
       virtual std::shared_ptr<Promise<void>> concat(double page, double a, double b, double c, double d, double x, double y) = 0;

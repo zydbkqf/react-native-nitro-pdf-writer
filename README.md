@@ -163,6 +163,45 @@ const ttFont = await pdf.loadTTFontFromFile(docHandle, '/path/to/font.ttf', true
 await pdf.setFontAndSize(pageHandle, ttFont, 24);
 ```
 
+## Images
+
+Only **JPEG** and **PNG** images are natively supported. Other formats (WebP, GIF, BMP, HEIF, etc.) must be decoded to raw pixel data (RGB/RGBA) by the caller before passing them to the library.
+
+### Vector graphics
+
+> ⚠️ Important limitation:
+This library **does NOT support direct‑import of any external vector files**.
+
+Common vector format SVG cannot be loaded directly.
+- If you need to embed SVG into PDF: you must rasterize SVG to PNG/JPG bitmap **on the JS‑side first**.
+- After rasterization the graphic will become a bitmap inside PDF (it loses vector property; zoom‑in will produce jaggy/blurry result).
+
+Other vector formats (wmf/emf etc.) are also not supported.
+> Professional source files such as ai, eps, cdr, dwg are out‑of‑scope and not supported.
+
+If you truly want true vector graphics inside output PDF, you need to use the drawing path APIs to construct shapes programmatically.
+
+```typescript
+// PNG or JPEG — load directly from file
+const img = await pdf.loadPngImageFromFile(docHandle, '/path/to/photo.png');
+const img2 = await pdf.loadJpegImageFromFile(docHandle, '/path/to/photo.jpg');
+await pdf.drawImage(pageHandle, img, 50, 500, 200, 150);
+
+// PNG — load from memory buffer (e.g. fetched from network)
+const imgFromBuf = await pdf.loadPngImageFromBuffer(docHandle, pngArrayBuffer);
+await pdf.drawImage(pageHandle, imgFromBuf, 50, 300, 200, 150);
+
+// Other formats — decode to raw pixels yourself, then use drawRawImage
+// (RGB, RGBA, or grayscale, 8 bits per component)
+const rawPixels: ArrayBuffer = /* decoded pixel data */;
+await pdf.drawRawImage(
+  pageHandle, rawPixels,
+  1024, 768,             // pixel dimensions
+  0,                     // HPDF_CS_DEVICE_RGB
+  50, 100, 300, 225,     // x, y, drawWidth, drawHeight (PDF points)
+);
+```
+
 ## Error handling
 
 When libharu fails, the rejected `Promise` carries a readable error that includes the libharu constant name and a short explanation. For example:
@@ -218,7 +257,7 @@ The module exposes libharu's core methods, including but not limited to:
 - Fonts: `getFont`, `getFont2`, `loadTypeFontFromFile`, `loadTypeFontFromFile2`, `setCurrentFont`, `getFontName`
 - Text: `beginText`, `endText`, `textOut`, `textRect`, `showText`, `showTextNextLine`, `textWidth`
 - Graphics: `moveTo`, `lineTo`, `curveTo`, `rectangle`, `circle`, `ellipse`, `stroke`, `fill`, `setLineWidth`, `setRGBFill`, `setRGBStroke`
-- Images: `loadPngImageFromFile`, `loadJpegImageFromFile`, `drawImage`
+- Images: `loadPngImageFromFile`, `loadJpegImageFromFile`, `loadRawImageFromBuffer`, `drawRawImage`, `drawImage`
 - Output: `saveToBuffer`, `saveToFile`
 
 All methods are asynchronous and return `Promise<T>`.
