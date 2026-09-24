@@ -20,6 +20,8 @@
 #include <NitroModules/ArrayBuffer.hpp>
 #include <optional>
 #include <vector>
+#include <variant>
+#include <NitroModules/AnyMap.hpp>
 
 namespace margelo::nitro::pdfwriter {
 
@@ -162,6 +164,9 @@ namespace margelo::nitro::pdfwriter {
       virtual std::shared_ptr<Promise<double>> pageTextWidth(double page, const std::string& text) = 0;
       virtual std::shared_ptr<Promise<double>> pageTextHeight(double page, const std::string& text) = 0;
       virtual std::shared_ptr<Promise<double>> pageMeasureText(double page, const std::string& text, double width, std::optional<bool> wordwrap) = 0;
+      virtual std::shared_ptr<Promise<std::variant<std::string, double>>> quickDraw(const std::vector<std::shared_ptr<AnyMap>>& operations, const std::string& unit, const std::optional<std::string>& outputPath, std::optional<double> dpi) = 0;
+      virtual std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> quickBatchDraw(const std::vector<std::shared_ptr<AnyMap>>& items, std::optional<double> dpi) = 0;
+      virtual std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> yuv2rgb(const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, const std::string& format) = 0;
 
     protected:
       // Hybrid Setup

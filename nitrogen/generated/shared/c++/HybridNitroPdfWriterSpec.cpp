@@ -124,6 +124,9 @@ namespace margelo::nitro::pdfwriter {
       prototype.registerHybridMethod("pageTextWidth", &HybridNitroPdfWriterSpec::pageTextWidth);
       prototype.registerHybridMethod("pageTextHeight", &HybridNitroPdfWriterSpec::pageTextHeight);
       prototype.registerHybridMethod("pageMeasureText", &HybridNitroPdfWriterSpec::pageMeasureText);
+      prototype.registerHybridMethod("quickDraw", &HybridNitroPdfWriterSpec::quickDraw);
+      prototype.registerHybridMethod("quickBatchDraw", &HybridNitroPdfWriterSpec::quickBatchDraw);
+      prototype.registerHybridMethod("yuv2rgb", &HybridNitroPdfWriterSpec::yuv2rgb);
     });
   }
 

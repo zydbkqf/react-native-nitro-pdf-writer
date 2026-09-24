@@ -24,6 +24,10 @@ public:
     if (pointer == nullptr) {
       return 0;
     }
+    auto it = _pointerToHandle.find(pointer);
+    if (it != _pointerToHandle.end()) {
+      return it->second;
+    }
     double handle = ++_nextHandle;
     _entries[handle] = {pointer, owner};
     _pointerToHandle[pointer] = handle;
@@ -79,7 +83,6 @@ public:
   void clear() {
     _entries.clear();
     _pointerToHandle.clear();
-    _nextHandle = 0;
   }
 
   const std::unordered_map<double, Entry>& allEntries() const {

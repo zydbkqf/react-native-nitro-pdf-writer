@@ -190,9 +190,17 @@ inline void throwHaruError(HPDF_Doc doc) {
 }
 
 inline void throwOnHaruError(HPDF_STATUS status, HPDF_Doc doc) {
-  if (status != HPDF_OK) {
-    throwHaruError(doc);
+  if (status == HPDF_OK) return;
+  HPDF_STATUS error = doc ? HPDF_GetError(doc) : HPDF_OK;
+  if (error == HPDF_OK) error = status;
+  HPDF_UINT detail = doc != nullptr ? HPDF_GetErrorDetail(doc) : 0;
+  std::ostringstream message;
+  message << haruErrorName(error) << " (0x" << std::hex << error << ")";
+  message << ": " << haruErrorMessage(error);
+  if (detail != 0) {
+    message << " [detail: " << std::dec << detail << "]";
   }
+  throw std::runtime_error(message.str());
 }
 
 } // namespace margelo::nitro::pdfwriter

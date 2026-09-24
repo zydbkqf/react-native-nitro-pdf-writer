@@ -2,6 +2,7 @@
 #include "HaruError.hpp"
 #include "HaruLock.hpp"
 #include <NitroModules/ArrayBuffer.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <variant>
 #include <vector>
 
 namespace margelo::nitro::pdfwriter {
@@ -47,13 +49,86 @@ static std::string makeTempPath() {
 }
 
 static HPDF_DashMode toDashMode(const std::vector<double>& pattern) {
-  HPDF_DashMode mode;
+  HPDF_DashMode mode{};
   mode.num_ptn = static_cast<HPDF_UINT>(std::min(pattern.size(), static_cast<size_t>(8)));
   for (size_t i = 0; i < mode.num_ptn; ++i) {
     mode.ptn[i] = static_cast<HPDF_REAL>(pattern[i]);
   }
   mode.phase = 0;
   return mode;
+}
+
+// ---------------------------------------------------------------------------
+// AnyValue extraction helpers — tolerate string-encoded numbers/bools
+// ---------------------------------------------------------------------------
+
+template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
+// JS Number() semantics: "" → 0, "123abc" → throws, "0x10" → 16
+static double anyToDouble(const AnyValue& v) {
+  return std::visit(overloaded{
+    [](double arg) -> double { return arg; },
+    [](int64_t arg) -> double { return static_cast<double>(arg); },
+    [](bool arg) -> double { return arg ? 1.0 : 0.0; },
+    [](NullType) -> double { return 0.0; },
+    [](const std::string& s) -> double {
+      if (s.empty()) return 0.0;
+      try {
+        size_t pos = 0;
+        double result = std::stod(s, &pos);
+        if (pos != s.size()) throw std::invalid_argument("trailing");
+        return result;
+      } catch (...) {
+        throw std::invalid_argument("Cannot convert string to number: " + s);
+      }
+    },
+    [](const auto&) -> double { throw std::invalid_argument("Value is not a number"); }
+  }, v);
+}
+
+static float anyToFloat(const AnyValue& v) {
+  return static_cast<HPDF_REAL>(anyToDouble(v));
+}
+
+static bool anyToBool(const AnyValue& v) {
+  return std::visit(overloaded{
+    [](bool arg) -> bool { return arg; },
+    [](double arg) -> bool { return arg != 0.0 && !std::isnan(arg); },
+    [](int64_t arg) -> bool { return arg != 0; },
+    [](NullType) -> bool { return false; },
+    [](const std::string& s) -> bool { return !s.empty(); },
+    [](const AnyArray&) -> bool { return true; },
+    [](const AnyObject&) -> bool { return true; },
+  }, v);
+}
+
+static std::string anyToString(const AnyValue& v) {
+  return std::visit(overloaded{
+    [](const std::string& s) -> std::string { return s; },
+    [](double arg) -> std::string {
+      if (std::isnan(arg)) return "NaN";
+      if (std::isinf(arg)) return arg > 0 ? "Infinity" : "-Infinity";
+      // Use shortest round-trip representation
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%.17g", arg);
+      // Trim to shortest representation that round-trips
+      for (int prec = 1; prec <= 17; ++prec) {
+        char tryBuf[32];
+        snprintf(tryBuf, sizeof(tryBuf), "%.*g", prec, arg);
+        try {
+          if (std::stod(tryBuf) == arg) { snprintf(buf, sizeof(buf), "%s", tryBuf); break; }
+        } catch (...) {
+          // Try a higher precision
+        }
+      }
+      return buf;
+    },
+    [](int64_t arg) -> std::string { return std::to_string(arg); },
+    [](bool arg) -> std::string { return arg ? "true" : "false"; },
+    [](NullType) -> std::string { return ""; },
+    [](const auto&) -> std::string { throw std::invalid_argument("Value cannot be converted to string"); }
+  }, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +175,28 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::freeDocument(double doc) {
     if (pointer != nullptr) {
       _docs.unregisterHandle(doc);
       HPDF_Free(pointer);
+      // Child handles are owned by the document and are now dangling.
+      auto cleanup = [pointer](auto& registry) {
+        std::vector<double> stale;
+        for (const auto& entry : registry.allEntries()) {
+          if (entry.second.owner == pointer) {
+            stale.push_back(entry.first);
+          }
+        }
+        for (double handle : stale) {
+          registry.unregisterHandle(handle);
+        }
+        return stale;
+      };
+      for (double handle : cleanup(_pages)) {
+        _pagesInTextMode.erase(handle);
+      }
+      cleanup(_fonts);
+      cleanup(_images);
+      cleanup(_destinations);
+      cleanup(_outlines);
+      cleanup(_extGStates);
+      cleanup(_annotations);
     }
   });
   return promise;
@@ -125,23 +222,27 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::sav
     // Save to a temporary file and read it back. libHaru's public API does
     // not expose a simple save-to-memory helper, so this is the safest route.
     std::string tempPath = makeTempPath();
+    struct TempFileGuard {
+      std::string path;
+      ~TempFileGuard() { std::remove(path.c_str()); }
+    } tempGuard{tempPath};
     throwOnHaruError(HPDF_SaveToFile(pointer, tempPath.c_str()), pointer);
     throwHaruError(pointer);
 
     std::ifstream file(tempPath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-      std::remove(tempPath.c_str());
       throw std::runtime_error("Failed to open temporary PDF file");
     }
     std::streamsize size = file.tellg();
+    if (size < 0) {
+      throw std::runtime_error("Failed to determine temporary PDF file size");
+    }
     file.seekg(0, std::ios::beg);
 
     std::shared_ptr<ArrayBuffer> buffer = ArrayBuffer::allocate(static_cast<size_t>(size));
     if (!file.read(reinterpret_cast<char*>(buffer->data()), size)) {
-      std::remove(tempPath.c_str());
       throw std::runtime_error("Failed to read temporary PDF file");
     }
-    std::remove(tempPath.c_str());
     return buffer;
   });
   return promise;
@@ -386,6 +487,7 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadType1FontFromFile(dou
     const char* pfm = pfmPath.has_value() ? pfmPath->c_str() : nullptr;
     const char* fontName = HPDF_LoadType1FontFromFile(h.get(), afmPath.c_str(), pfm);
     throwHaruError(h.get());
+    if (!fontName) throw std::runtime_error("Failed to load font");
     HPDF_Font font = HPDF_GetFont(h.get(), fontName, nullptr);
     throwHaruError(h.get());
     return _fonts.registerPointer(font, h.get());
@@ -402,6 +504,7 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadTTFontFromFile(double
     HPDF_BOOL embed = embedding.value_or(HPDF_FALSE);
     const char* fontName = HPDF_LoadTTFontFromFile(h.get(), fileName.c_str(), embed);
     throwHaruError(h.get());
+    if (!fontName) throw std::runtime_error("Failed to load font");
     HPDF_Font font = HPDF_GetFont(h.get(), fontName, nullptr);
     throwHaruError(h.get());
     return _fonts.registerPointer(font, h.get());
@@ -419,6 +522,7 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadTTFontFromFile2(doubl
     HPDF_BOOL embed = embedding.value_or(HPDF_FALSE);
     const char* fontName = HPDF_LoadTTFontFromFile2(h.get(), fileName.c_str(), static_cast<HPDF_UINT>(index), embed);
     throwHaruError(h.get());
+    if (!fontName) throw std::runtime_error("Failed to load font");
     HPDF_Font font = HPDF_GetFont(h.get(), fontName, nullptr);
     throwHaruError(h.get());
     return _fonts.registerPointer(font, h.get());
@@ -432,10 +536,9 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::setCurrentFont(double doc, 
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> docH(doc, _docs);
     Handle<HPDF_Font> fontH(font, _fonts);
-    // libHaru tracks the current font internally per page; this is a no-op
-    // placeholder kept for API completeness.
-    (void)docH;
-    (void)fontH;
+    (void)docH.get();
+    (void)fontH.get();
+    throw std::runtime_error("setCurrentFont is not supported; use setFontAndSize instead");
   });
   return promise;
 }
@@ -487,7 +590,14 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::beginText(double page) {
   HaruWorker::getInstance().run(promise, [this, page]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Page> h(page, _pages);
+
+    // Check if already in text mode
+    if (_pagesInTextMode.count(page) > 0) {
+      throw std::runtime_error("Nested beginText() is not allowed. Call endText() before calling beginText() again.");
+    }
+
     throwOnHaruError(HPDF_Page_BeginText(h.get()), h.owner());
+    _pagesInTextMode.insert(page);
   });
   return promise;
 }
@@ -498,6 +608,7 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::endText(double page) {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Page> h(page, _pages);
     throwOnHaruError(HPDF_Page_EndText(h.get()), h.owner());
+    _pagesInTextMode.erase(page);
   });
   return promise;
 }
@@ -507,6 +618,12 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::textOut(double page, double
   HaruWorker::getInstance().run(promise, [this, page, x, y, text]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Page> h(page, _pages);
+
+    // Check if in text mode
+    if (_pagesInTextMode.count(page) == 0) {
+      throw std::runtime_error("textOut() requires beginText() to be called first.");
+    }
+
     throwOnHaruError(HPDF_Page_TextOut(h.get(), static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y), text.c_str()),
                  h.owner());
   });
@@ -520,10 +637,15 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::textRect(double page, doubl
   HaruWorker::getInstance().run(promise, [this, page, left, top, right, bottom, text, align]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Page> h(page, _pages);
-    HPDF_Rect rect{static_cast<HPDF_REAL>(left), static_cast<HPDF_REAL>(top),
-                   static_cast<HPDF_REAL>(right), static_cast<HPDF_REAL>(bottom)};
-    throwOnHaruError(HPDF_Page_TextRect(h.get(), rect.left, rect.top, rect.right, rect.bottom, text.c_str(),
-                                    static_cast<HPDF_TextAlignment>(align), nullptr),
+
+    // Check if in text mode
+    if (_pagesInTextMode.count(page) == 0) {
+      throw std::runtime_error("textRect() requires beginText() to be called first.");
+    }
+
+    throwOnHaruError(HPDF_Page_TextRect(h.get(), static_cast<HPDF_REAL>(left), static_cast<HPDF_REAL>(top),
+                                    static_cast<HPDF_REAL>(right), static_cast<HPDF_REAL>(bottom),
+                                    text.c_str(), static_cast<HPDF_TextAlignment>(align), nullptr),
                  h.owner());
   });
   return promise;
@@ -680,7 +802,7 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::setDash(double page, const 
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Page> h(page, _pages);
     HPDF_DashMode mode = toDashMode(dashPattern);
-    mode.phase = static_cast<HPDF_UINT>(phase);
+    mode.phase = static_cast<HPDF_REAL>(phase);
     throwOnHaruError(HPDF_Page_SetDash(h.get(), mode.ptn, mode.num_ptn, mode.phase), h.owner());
   });
   return promise;
@@ -1067,6 +1189,22 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromBuffer(do
   HaruWorker::getInstance().run<double>(promise, [this, doc, buffer, width, height, colorSpace]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
+    if (width <= 0 || height <= 0) {
+      throw std::invalid_argument("Width and height must be positive");
+    }
+    size_t components = 3;
+    HPDF_ColorSpace cs = static_cast<HPDF_ColorSpace>(colorSpace);
+    if (cs == HPDF_CS_DEVICE_GRAY) {
+      components = 1;
+    } else if (cs == HPDF_CS_DEVICE_RGB) {
+      components = 3;
+    } else if (cs == HPDF_CS_DEVICE_CMYK) {
+      components = 4;
+    }
+    size_t expected = static_cast<size_t>(width) * static_cast<size_t>(height) * components;
+    if (buffer->size() < expected) {
+      throw std::invalid_argument("Buffer too small for raw image data");
+    }
     HPDF_Image image = HPDF_LoadRawImageFromMem(h.get(), buffer->data(),
                                                 static_cast<HPDF_UINT>(width),
                                                 static_cast<HPDF_UINT>(height),
@@ -1118,6 +1256,23 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::drawRawImage(double page,
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Page> pageH(page, _pages);
     HPDF_Doc doc = pageH.owner();
+
+    if (width <= 0 || height <= 0) {
+      throw std::invalid_argument("Width and height must be positive");
+    }
+    size_t components = 3;
+    HPDF_ColorSpace cs = static_cast<HPDF_ColorSpace>(colorSpace);
+    if (cs == HPDF_CS_DEVICE_GRAY) {
+      components = 1;
+    } else if (cs == HPDF_CS_DEVICE_RGB) {
+      components = 3;
+    } else if (cs == HPDF_CS_DEVICE_CMYK) {
+      components = 4;
+    }
+    size_t expected = static_cast<size_t>(width) * static_cast<size_t>(height) * components;
+    if (buffer->size() < expected) {
+      throw std::invalid_argument("Buffer too small for raw image data");
+    }
 
     HPDF_Image image = HPDF_LoadRawImageFromMem(doc, buffer->data(),
                                                 static_cast<HPDF_UINT>(width),
@@ -1336,7 +1491,13 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createOutline(double doc,
   HaruWorker::getInstance().run<double>(promise, [this, doc, parent, title, encoder]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> docH(doc, _docs);
-    HPDF_Outline parentPointer = parent == 0 ? nullptr : _outlines.getPointer(parent);
+    HPDF_Outline parentPointer = nullptr;
+    if (parent != 0) {
+      parentPointer = _outlines.getPointer(parent);
+      if (parentPointer == nullptr) {
+        throw std::invalid_argument("Invalid parent outline handle");
+      }
+    }
     HPDF_Encoder encoderPtr = nullptr;
     if (encoder.has_value() && !encoder->empty()) {
       encoderPtr = HPDF_GetEncoder(docH.get(), encoder->c_str());
@@ -1439,8 +1600,10 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::setInfoDateAttr(double doc,
     Handle<HPDF_Doc> h(doc, _docs);
     HPDF_Date date{};
     // Parse a tiny subset: "YYYY-MM-DD HH:MM:SS"
-    std::sscanf(value.c_str(), "%d-%d-%d %d:%d:%d", &date.year, &date.month, &date.day,
-                &date.hour, &date.minutes, &date.seconds);
+    if (std::sscanf(value.c_str(), "%d-%d-%d %d:%d:%d", &date.year, &date.month, &date.day,
+                &date.hour, &date.minutes, &date.seconds) != 6) {
+      throw std::invalid_argument("Invalid date format, expected YYYY-MM-DD HH:MM:SS");
+    }
     throwOnHaruError(HPDF_SetInfoDateAttr(h.get(), static_cast<HPDF_InfoType>(infoType), date), h.get());
   });
   return promise;
@@ -1477,7 +1640,6 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::pageTextHeight(double pag
     HPDF_INT ascent = HPDF_Font_GetAscent(font);
     HPDF_INT descent = HPDF_Font_GetDescent(font);
     HPDF_REAL lineHeight = (ascent - descent) * size / 1000.0f;
-    HPDF_UINT charCount = static_cast<HPDF_UINT>(std::strlen(text.c_str()));
     HPDF_REAL textWidth = HPDF_Page_TextWidth(h.get(), text.c_str());
     HPDF_REAL pageWidth = HPDF_Page_GetWidth(h.get());
     HPDF_UINT lines = pageWidth > 0 ? static_cast<HPDF_UINT>(std::ceil(textWidth / pageWidth)) : 1;
@@ -1502,6 +1664,841 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::pageMeasureText(double pa
     return static_cast<double>(realWidth);
   });
   return promise;
+}
+
+// ---------------------------------------------------------------------------
+// Quick Draw (High-level API)
+// ---------------------------------------------------------------------------
+
+static double convertToPt(double value, const std::string& unit, double dpi = 72.0) {
+    if (unit == "mm") return value * (72.0 / 25.4);
+    if (unit == "cm") return value * (72.0 / 2.54);
+    if (unit == "in") return value * 72.0;
+    if (unit == "px") return (value / dpi) * 72.0;
+    return value; // "pt" or default
+}
+
+static HPDF_ColorSpace getColorSpace(const std::string& cs) {
+    if (cs == "rgb" || cs == "RGB") return HPDF_CS_DEVICE_RGB;
+    if (cs == "gray" || cs == "Gray" || cs == "GRAY") return HPDF_CS_DEVICE_GRAY;
+    if (cs == "cmyk" || cs == "CMYK") return HPDF_CS_DEVICE_CMYK;
+    return HPDF_CS_DEVICE_RGB;
+}
+
+static HPDF_TextAlignment getAlign(const std::string& align) {
+    if (align == "right") return HPDF_TALIGN_RIGHT;
+    if (align == "center") return HPDF_TALIGN_CENTER;
+    if (align == "justify") return HPDF_TALIGN_JUSTIFY;
+    return HPDF_TALIGN_LEFT;
+}
+
+static HPDF_LineCap getLineCap(const std::string& cap) {
+    if (cap == "round") return HPDF_ROUND_END;
+    if (cap == "projectingSquare") return HPDF_PROJECTING_SQUARE_END;
+    return HPDF_BUTT_END;
+}
+
+static HPDF_LineJoin getLineJoin(const std::string& join) {
+    if (join == "round") return HPDF_ROUND_JOIN;
+    if (join == "bevel") return HPDF_BEVEL_JOIN;
+    return HPDF_MITER_JOIN;
+}
+
+void HybridNitroPdfWriter::executeOperation(
+    HPDF_Doc doc, HPDF_Page& page, const std::shared_ptr<AnyMap>& op,
+    const std::string& defaultUnit, double dpi) {
+
+    std::string type = op->getString("type");
+    if (type.empty()) return;
+
+    if (type == "page") {
+        std::string unit = op->contains("unit") ? op->getString("unit") : defaultUnit;
+
+        page = HPDF_AddPage(doc);
+        throwHaruError(doc);
+        if (!page) throw std::runtime_error("Failed to add page");
+        if (op->contains("width") && op->contains("height")) {
+            HPDF_Page_SetWidth(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(op->getAny("width")), unit, dpi)));
+            HPDF_Page_SetHeight(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(op->getAny("height")), unit, dpi)));
+        } else if (op->contains("size")) {
+            std::string sizeStr = op->getString("size");
+            std::transform(sizeStr.begin(), sizeStr.end(), sizeStr.begin(), ::tolower);
+            HPDF_PageSizes size = HPDF_PAGE_SIZE_A4;
+            if (sizeStr == "letter") size = HPDF_PAGE_SIZE_LETTER;
+            else if (sizeStr == "legal") size = HPDF_PAGE_SIZE_LEGAL;
+            else if (sizeStr == "a3") size = HPDF_PAGE_SIZE_A3;
+            else if (sizeStr == "a4") size = HPDF_PAGE_SIZE_A4;
+            else if (sizeStr == "a5") size = HPDF_PAGE_SIZE_A5;
+            else if (sizeStr == "b4") size = HPDF_PAGE_SIZE_B4;
+            else if (sizeStr == "b5") size = HPDF_PAGE_SIZE_B5;
+
+            HPDF_PageDirection direction = HPDF_PAGE_PORTRAIT;
+            if (op->contains("direction") && op->getString("direction") == "landscape") {
+                direction = HPDF_PAGE_LANDSCAPE;
+            }
+            HPDF_Page_SetSize(page, size, direction);
+        } else if (op->contains("direction") && op->getString("direction") == "landscape") {
+            HPDF_Page_SetWidth(page, 841.89f);
+            HPDF_Page_SetHeight(page, 595.28f);
+        } else {
+            HPDF_Page_SetWidth(page, 595.28f);
+            HPDF_Page_SetHeight(page, 841.89f);
+        }
+    }
+    else if (type == "font" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        double fontSize = anyToDouble(data.at("size"));
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+        fontSize = convertToPt(fontSize, unit, dpi);
+
+        HPDF_Font font = nullptr;
+        if (data.contains("filePath")) {
+            std::string path = anyToString(data.at("filePath"));
+            std::string encodingStr;
+            const char* encoding = nullptr;
+            if (data.contains("encoding")) {
+              encodingStr = anyToString(data.at("encoding"));
+              encoding = encodingStr.c_str();
+            }
+
+            std::string ext = path.length() >= 4 ? path.substr(path.length() - 4) : "";
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".otf") {
+                throw std::runtime_error("OTF fonts with CFF outlines are not supported by libharu. Please convert to TTF or use a TTC file instead.");
+            }
+
+            const char* fontNameCStr = nullptr;
+            if (ext == ".ttc") {
+                HPDF_UINT index = data.contains("fontIndex") ? static_cast<HPDF_UINT>(anyToDouble(data.at("fontIndex"))) : 0;
+                fontNameCStr = HPDF_LoadTTFontFromFile2(doc, path.c_str(), index, HPDF_TRUE);
+            } else {
+                fontNameCStr = HPDF_LoadTTFontFromFile(doc, path.c_str(), HPDF_TRUE);
+            }
+            throwHaruError(doc);
+            if (!fontNameCStr) throw std::runtime_error("Failed to load font");
+            font = HPDF_GetFont(doc, fontNameCStr, encoding);
+        } else {
+            std::string fontName = anyToString(data.at("name"));
+            std::string encodingStr;
+            const char* encoding = nullptr;
+            if (data.contains("encoding")) {
+              encodingStr = anyToString(data.at("encoding"));
+              encoding = encodingStr.c_str();
+            }
+            font = HPDF_GetFont(doc, fontName.c_str(), encoding);
+        }
+        throwHaruError(doc);
+        HPDF_Page_SetFontAndSize(page, font, static_cast<HPDF_REAL>(fontSize));
+        throwHaruError(doc);
+    }
+    else if (type == "color" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string target = op->contains("target") ? op->getString("target") : "both";
+
+        if (data.contains("r") && data.contains("g") && data.contains("b")) {
+            float r = anyToFloat(data.at("r"));
+            float g = anyToFloat(data.at("g"));
+            float b = anyToFloat(data.at("b"));
+            if (target == "fill" || target == "both") HPDF_Page_SetRGBFill(page, r, g, b);
+            if (target == "stroke" || target == "both") HPDF_Page_SetRGBStroke(page, r, g, b);
+        } else if (data.contains("gray")) {
+            float gray = anyToFloat(data.at("gray"));
+            if (target == "fill" || target == "both") HPDF_Page_SetGrayFill(page, gray);
+            if (target == "stroke" || target == "both") HPDF_Page_SetGrayStroke(page, gray);
+        } else if (data.contains("c") && data.contains("m") && data.contains("y") && data.contains("k")) {
+            float c = anyToFloat(data.at("c"));
+            float m = anyToFloat(data.at("m"));
+            float y = anyToFloat(data.at("y"));
+            float k = anyToFloat(data.at("k"));
+            if (target == "fill" || target == "both") HPDF_Page_SetCMYKFill(page, c, m, y, k);
+            if (target == "stroke" || target == "both") HPDF_Page_SetCMYKStroke(page, c, m, y, k);
+        }
+        throwHaruError(doc);
+    }
+    else if (type == "text" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string content = anyToString(data.at("content"));
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        double x = convertToPt(anyToDouble(data.at("x")), unit, dpi);
+        double y = convertToPt(anyToDouble(data.at("y")), unit, dpi);
+
+        if (data.contains("font")) {
+            auto font = std::get<AnyObject>(data.at("font"));
+            std::string fontName = anyToString(font.at("name"));
+            double fontSize = anyToDouble(font.at("size"));
+            std::string fontUnit = font.contains("unit") ? anyToString(font.at("unit")) : unit;
+            fontSize = convertToPt(fontSize, fontUnit, dpi);
+
+            HPDF_Font hFont = HPDF_GetFont(doc, fontName.c_str(), nullptr);
+            throwHaruError(doc);
+            HPDF_Page_SetFontAndSize(page, hFont, static_cast<HPDF_REAL>(fontSize));
+            throwHaruError(doc);
+        }
+
+        if (data.contains("color")) {
+            auto color = std::get<AnyObject>(data.at("color"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBFill(page, anyToFloat(color.at("r")),
+                                     anyToFloat(color.at("g")),
+                                     anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayFill(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKFill(page, anyToFloat(color.at("c")),
+                                      anyToFloat(color.at("m")),
+                                      anyToFloat(color.at("y")),
+                                      anyToFloat(color.at("k")));
+            }
+        }
+
+        HPDF_Page_BeginText(page);
+        throwHaruError(doc);
+
+        if (data.contains("width") && data.contains("height")) {
+            double w = convertToPt(anyToDouble(data.at("width")), unit, dpi);
+            double h = convertToPt(anyToDouble(data.at("height")), unit, dpi);
+            HPDF_TextAlignment align = data.contains("align") ?
+                                       getAlign(anyToString(data.at("align"))) : HPDF_TALIGN_LEFT;
+            HPDF_Page_TextRect(page, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y),
+                              static_cast<HPDF_REAL>(x + w), static_cast<HPDF_REAL>(y - h),
+                              content.c_str(), align, nullptr);
+        } else {
+            HPDF_Page_TextOut(page, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y), content.c_str());
+        }
+        throwHaruError(doc);
+
+        HPDF_Page_EndText(page);
+        throwHaruError(doc);
+    }
+    else if (type == "image" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        double x = convertToPt(anyToDouble(data.at("x")), unit, dpi);
+        double y = convertToPt(anyToDouble(data.at("y")), unit, dpi);
+        double width = convertToPt(anyToDouble(data.at("width")), unit, dpi);
+        double height = convertToPt(anyToDouble(data.at("height")), unit, dpi);
+
+        std::string source = anyToString(data.at("source"));
+
+        HPDF_Image image;
+        std::string format = data.contains("format") ? anyToString(data.at("format")) : "";
+
+        if (!format.empty()) {
+            if (format == "jpeg") {
+                image = HPDF_LoadJpegImageFromFile(doc, source.c_str());
+            } else {
+                image = HPDF_LoadPngImageFromFile(doc, source.c_str());
+            }
+        } else {
+            std::string ext = std::filesystem::path(source).extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".jpg" || ext == ".jpeg") {
+                image = HPDF_LoadJpegImageFromFile(doc, source.c_str());
+            } else {
+                image = HPDF_LoadPngImageFromFile(doc, source.c_str());
+            }
+        }
+        throwHaruError(doc);
+
+        HPDF_Page_DrawImage(page, image, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y),
+                           static_cast<HPDF_REAL>(width), static_cast<HPDF_REAL>(height));
+        throwHaruError(doc);
+    }
+    else if (type == "line" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        double x1 = convertToPt(anyToDouble(data.at("x1")), unit, dpi);
+        double y1 = convertToPt(anyToDouble(data.at("y1")), unit, dpi);
+        double x2 = convertToPt(anyToDouble(data.at("x2")), unit, dpi);
+        double y2 = convertToPt(anyToDouble(data.at("y2")), unit, dpi);
+
+        if (data.contains("lineWidth")) {
+            HPDF_Page_SetLineWidth(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(data.at("lineWidth")), unit, dpi)));
+        }
+
+        if (data.contains("lineCap")) {
+            HPDF_Page_SetLineCap(page, getLineCap(anyToString(data.at("lineCap"))));
+        }
+
+        if (data.contains("lineJoin")) {
+            HPDF_Page_SetLineJoin(page, getLineJoin(anyToString(data.at("lineJoin"))));
+        }
+
+        if (data.contains("color")) {
+            auto color = std::get<AnyObject>(data.at("color"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBStroke(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayStroke(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKStroke(page, anyToFloat(color.at("c")),
+                                        anyToFloat(color.at("m")),
+                                        anyToFloat(color.at("y")),
+                                        anyToFloat(color.at("k")));
+            }
+        }
+
+        HPDF_Page_MoveTo(page, static_cast<HPDF_REAL>(x1), static_cast<HPDF_REAL>(y1));
+        HPDF_Page_LineTo(page, static_cast<HPDF_REAL>(x2), static_cast<HPDF_REAL>(y2));
+        HPDF_Page_Stroke(page);
+        throwHaruError(doc);
+    }
+    else if (type == "rectangle" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        double x = convertToPt(anyToDouble(data.at("x")), unit, dpi);
+        double y = convertToPt(anyToDouble(data.at("y")), unit, dpi);
+        double width = convertToPt(anyToDouble(data.at("width")), unit, dpi);
+        double height = convertToPt(anyToDouble(data.at("height")), unit, dpi);
+
+        if (data.contains("lineWidth")) {
+            HPDF_Page_SetLineWidth(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(data.at("lineWidth")), unit, dpi)));
+        }
+
+        if (data.contains("fillColor")) {
+            auto color = std::get<AnyObject>(data.at("fillColor"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBFill(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayFill(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKFill(page, anyToFloat(color.at("c")),
+                                      anyToFloat(color.at("m")),
+                                      anyToFloat(color.at("y")),
+                                      anyToFloat(color.at("k")));
+            }
+        }
+
+        if (data.contains("strokeColor")) {
+            auto color = std::get<AnyObject>(data.at("strokeColor"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBStroke(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayStroke(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKStroke(page, anyToFloat(color.at("c")),
+                                        anyToFloat(color.at("m")),
+                                        anyToFloat(color.at("y")),
+                                        anyToFloat(color.at("k")));
+            }
+        }
+
+        HPDF_Page_Rectangle(page, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y),
+                            static_cast<HPDF_REAL>(width), static_cast<HPDF_REAL>(height));
+
+        bool fill = data.contains("fill") && anyToBool(data.at("fill"));
+        bool stroke = !data.contains("stroke") || anyToBool(data.at("stroke"));
+
+        if (fill && stroke) {
+            HPDF_Page_FillStroke(page);
+        } else if (fill) {
+            HPDF_Page_Fill(page);
+        } else if (stroke) {
+            HPDF_Page_Stroke(page);
+        } else {
+            HPDF_Page_EndPath(page);
+        }
+        throwHaruError(doc);
+    }
+    else if (type == "circle" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        double x = convertToPt(anyToDouble(data.at("x")), unit, dpi);
+        double y = convertToPt(anyToDouble(data.at("y")), unit, dpi);
+        double radius = convertToPt(anyToDouble(data.at("radius")), unit, dpi);
+
+        if (data.contains("lineWidth")) {
+            HPDF_Page_SetLineWidth(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(data.at("lineWidth")), unit, dpi)));
+        }
+
+        if (data.contains("fillColor")) {
+            auto color = std::get<AnyObject>(data.at("fillColor"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBFill(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayFill(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKFill(page, anyToFloat(color.at("c")),
+                                      anyToFloat(color.at("m")),
+                                      anyToFloat(color.at("y")),
+                                      anyToFloat(color.at("k")));
+            }
+        }
+
+        if (data.contains("strokeColor")) {
+            auto color = std::get<AnyObject>(data.at("strokeColor"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBStroke(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayStroke(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKStroke(page, anyToFloat(color.at("c")),
+                                        anyToFloat(color.at("m")),
+                                        anyToFloat(color.at("y")),
+                                        anyToFloat(color.at("k")));
+            }
+        }
+
+        HPDF_Page_Circle(page, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y),
+                         static_cast<HPDF_REAL>(radius));
+
+        bool fill = data.contains("fill") && anyToBool(data.at("fill"));
+        bool stroke = !data.contains("stroke") || anyToBool(data.at("stroke"));
+
+        if (fill && stroke) {
+            HPDF_Page_FillStroke(page);
+        } else if (fill) {
+            HPDF_Page_Fill(page);
+        } else if (stroke) {
+            HPDF_Page_Stroke(page);
+        } else {
+            HPDF_Page_EndPath(page);
+        }
+        throwHaruError(doc);
+    }
+    else if (type == "ellipse" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        double x = convertToPt(anyToDouble(data.at("x")), unit, dpi);
+        double y = convertToPt(anyToDouble(data.at("y")), unit, dpi);
+        double xRadius = convertToPt(anyToDouble(data.at("xRadius")), unit, dpi);
+        double yRadius = convertToPt(anyToDouble(data.at("yRadius")), unit, dpi);
+
+        if (data.contains("lineWidth")) {
+            HPDF_Page_SetLineWidth(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(data.at("lineWidth")), unit, dpi)));
+        }
+
+        if (data.contains("fillColor")) {
+            auto color = std::get<AnyObject>(data.at("fillColor"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBFill(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayFill(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKFill(page, anyToFloat(color.at("c")),
+                                      anyToFloat(color.at("m")),
+                                      anyToFloat(color.at("y")),
+                                      anyToFloat(color.at("k")));
+            }
+        }
+
+        if (data.contains("strokeColor")) {
+            auto color = std::get<AnyObject>(data.at("strokeColor"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBStroke(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                HPDF_Page_SetGrayStroke(page, anyToFloat(color.at("gray")));
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                HPDF_Page_SetCMYKStroke(page, anyToFloat(color.at("c")),
+                                        anyToFloat(color.at("m")),
+                                        anyToFloat(color.at("y")),
+                                        anyToFloat(color.at("k")));
+            }
+        }
+
+        HPDF_Page_Ellipse(page, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y),
+                          static_cast<HPDF_REAL>(xRadius), static_cast<HPDF_REAL>(yRadius));
+
+        bool fill = data.contains("fill") && anyToBool(data.at("fill"));
+        bool stroke = !data.contains("stroke") || anyToBool(data.at("stroke"));
+
+        if (fill && stroke) {
+            HPDF_Page_FillStroke(page);
+        } else if (fill) {
+            HPDF_Page_Fill(page);
+        } else if (stroke) {
+            HPDF_Page_Stroke(page);
+        } else {
+            HPDF_Page_EndPath(page);
+        }
+        throwHaruError(doc);
+    }
+    else if (type == "path" && op->contains("data")) {
+        auto data = op->getObject("data");
+
+        auto points = std::get<AnyArray>(data.at("points"));
+        if (points.size() < 2) return;
+
+        std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
+
+        if (data.contains("lineWidth")) {
+            HPDF_Page_SetLineWidth(page, static_cast<HPDF_REAL>(convertToPt(anyToDouble(data.at("lineWidth")), unit, dpi)));
+        }
+
+        if (data.contains("color")) {
+            auto color = std::get<AnyObject>(data.at("color"));
+            if (color.contains("r") && color.contains("g") && color.contains("b")) {
+                HPDF_Page_SetRGBFill(page, anyToFloat(color.at("r")),
+                                     anyToFloat(color.at("g")),
+                                     anyToFloat(color.at("b")));
+                HPDF_Page_SetRGBStroke(page, anyToFloat(color.at("r")),
+                                       anyToFloat(color.at("g")),
+                                       anyToFloat(color.at("b")));
+            } else if (color.contains("gray")) {
+                float gray = anyToFloat(color.at("gray"));
+                HPDF_Page_SetGrayFill(page, gray);
+                HPDF_Page_SetGrayStroke(page, gray);
+            } else if (color.contains("c") && color.contains("m") && color.contains("y") && color.contains("k")) {
+                float c = anyToFloat(color.at("c"));
+                float m = anyToFloat(color.at("m"));
+                float y = anyToFloat(color.at("y"));
+                float k = anyToFloat(color.at("k"));
+                HPDF_Page_SetCMYKFill(page, c, m, y, k);
+                HPDF_Page_SetCMYKStroke(page, c, m, y, k);
+            }
+        }
+
+        auto firstPt = std::get<AnyObject>(points[0]);
+        double fx = convertToPt(anyToDouble(firstPt.at("x")), unit, dpi);
+        double fy = convertToPt(anyToDouble(firstPt.at("y")), unit, dpi);
+
+        HPDF_Page_MoveTo(page, static_cast<HPDF_REAL>(fx), static_cast<HPDF_REAL>(fy));
+
+        for (size_t i = 1; i < points.size(); i++) {
+            auto pt = std::get<AnyObject>(points[i]);
+            double px = convertToPt(anyToDouble(pt.at("x")), unit, dpi);
+            double py = convertToPt(anyToDouble(pt.at("y")), unit, dpi);
+            HPDF_Page_LineTo(page, static_cast<HPDF_REAL>(px), static_cast<HPDF_REAL>(py));
+        }
+
+        bool close = data.contains("close") && anyToBool(data.at("close"));
+        if (close) HPDF_Page_ClosePath(page);
+
+        bool fill = data.contains("fill") && anyToBool(data.at("fill"));
+        bool stroke = !data.contains("stroke") || anyToBool(data.at("stroke"));
+
+        if (fill && stroke) {
+            HPDF_Page_FillStroke(page);
+        } else if (fill) {
+            HPDF_Page_Fill(page);
+        } else if (stroke) {
+            HPDF_Page_Stroke(page);
+        } else {
+            HPDF_Page_EndPath(page);
+        }
+        throwHaruError(doc);
+    }
+    else if (type == "rotate") {
+        if (op->contains("angle")) {
+            HPDF_Page_SetRotate(page, static_cast<HPDF_UINT16>(anyToDouble(op->getAny("angle"))));
+        }
+        throwHaruError(doc);
+    }
+    else if (type == "gSave") {
+        HPDF_Page_GSave(page);
+        throwHaruError(doc);
+    }
+    else if (type == "gRestore") {
+        HPDF_Page_GRestore(page);
+        throwHaruError(doc);
+    }
+    else if (type == "transform") {
+        if (op->contains("a") && op->contains("b") && op->contains("c") &&
+            op->contains("d") && op->contains("x") && op->contains("y")) {
+            std::string unit = op->contains("unit") ? op->getString("unit") : defaultUnit;
+            HPDF_Page_Concat(page,
+                            static_cast<HPDF_REAL>(anyToDouble(op->getAny("a"))),
+                            static_cast<HPDF_REAL>(anyToDouble(op->getAny("b"))),
+                            static_cast<HPDF_REAL>(anyToDouble(op->getAny("c"))),
+                            static_cast<HPDF_REAL>(anyToDouble(op->getAny("d"))),
+                            static_cast<HPDF_REAL>(convertToPt(anyToDouble(op->getAny("x")), unit, dpi)),
+                            static_cast<HPDF_REAL>(convertToPt(anyToDouble(op->getAny("y")), unit, dpi)));
+            throwHaruError(doc);
+        }
+    }
+}
+
+std::shared_ptr<Promise<std::variant<std::string, double>>> HybridNitroPdfWriter::quickDraw(
+    const std::vector<std::shared_ptr<AnyMap>>& operations, const std::string& unit,
+    const std::optional<std::string>& outputPath, std::optional<double> dpi) {
+
+    auto promise = Promise<std::variant<std::string, double>>::create();
+    HaruWorker::getInstance().run<std::variant<std::string, double>>(promise,
+        [this, operations, unit, outputPath, dpi]() {
+            std::lock_guard<std::mutex> lock(HaruLock::get());
+
+            double dpiVal = dpi.value_or(72.0);
+
+            // Create document
+            HPDF_Doc doc = HPDF_New(nullptr, nullptr);
+            if (doc == nullptr) {
+                throw std::runtime_error("Failed to create HPDF document");
+            }
+
+            try {
+                HPDF_Page page = nullptr;
+
+                for (const auto& op : operations) {
+                    // If no page exists yet and this isn't a page operation, create a default one
+                    if (page == nullptr && !(op->contains("type") && op->getString("type") == "page")) {
+                        page = HPDF_AddPage(doc);
+                        throwHaruError(doc);
+                    }
+                    // executeOperation takes page by reference; "page" ops create a new page internally
+                    executeOperation(doc, page, op, unit, dpiVal);
+                }
+
+                if (outputPath.has_value()) {
+                    // Save to file
+                    HPDF_SaveToFile(doc, outputPath->c_str());
+                    throwHaruError(doc);
+                    HPDF_Free(doc);
+                    return std::variant<std::string, double>(outputPath.value());
+                } else {
+                    // Return doc handle
+                    double handle = _docs.registerPointer(doc, nullptr);
+                    return std::variant<std::string, double>(handle);
+                }
+            } catch (...) {
+                HPDF_Free(doc);
+                throw;
+            }
+        });
+
+    return promise;
+}
+
+std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridNitroPdfWriter::quickBatchDraw(
+    const std::vector<std::shared_ptr<AnyMap>>& items, std::optional<double> dpi) {
+
+    auto promise = Promise<std::vector<std::variant<std::string, double>>>::create();
+    HaruWorker::getInstance().run<std::vector<std::variant<std::string, double>>>(promise,
+        [this, items, dpi]() {
+            std::lock_guard<std::mutex> lock(HaruLock::get());
+
+            double dpiVal = dpi.value_or(72.0);
+            std::vector<std::variant<std::string, double>> results;
+
+            for (const auto& item : items) {
+                try {
+                    // Get unit
+                    std::string unit = "pt";
+                    if (item->contains("unit")) {
+                        unit = item->getString("unit");
+                    }
+
+                    // Get operations
+                    if (!item->contains("operations")) {
+                        results.push_back(std::string("Missing or invalid operations"));
+                        continue;
+                    }
+
+                    auto opsArr = item->getArray("operations");
+                    std::vector<std::shared_ptr<AnyMap>> ops;
+                    for (auto& v : opsArr) {
+                        if (std::holds_alternative<AnyObject>(v)) {
+                            auto m = AnyMap::make();
+                            for (auto& [k, val] : std::get<AnyObject>(v)) m->setAny(k, val);
+                            ops.push_back(m);
+                        }
+                    }
+
+                    // Get output path
+                    std::optional<std::string> outputPath;
+                    if (item->contains("output")) {
+                        outputPath = item->getString("output");
+                    }
+
+                    // Create document
+                    HPDF_Doc doc = HPDF_New(nullptr, nullptr);
+                    if (doc == nullptr) {
+                        results.push_back(std::string("Failed to create document"));
+                        continue;
+                    }
+
+                    try {
+                        HPDF_Page page = nullptr;
+
+                        for (const auto& op : ops) {
+                            if (page == nullptr && !(op->contains("type") && op->getString("type") == "page")) {
+                                page = HPDF_AddPage(doc);
+                                throwHaruError(doc);
+                            }
+                            executeOperation(doc, page, op, unit, dpiVal);
+                        }
+
+                        if (outputPath.has_value()) {
+                            HPDF_SaveToFile(doc, outputPath->c_str());
+                            throwHaruError(doc);
+                            HPDF_Free(doc);
+                            results.push_back(outputPath.value());
+                        } else {
+                            double handle = _docs.registerPointer(doc, nullptr);
+                            results.push_back(handle);
+                        }
+                    } catch (const std::exception& e) {
+                        HPDF_Free(doc);
+                        results.push_back(std::string(e.what()));
+                    }
+                } catch (const std::exception& e) {
+                    results.push_back(std::string(e.what()));
+                }
+            }
+
+            return results;
+        });
+
+    return promise;
+}
+
+// ---------------------------------------------------------------------------
+// YUV to RGB conversion
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv2rgb(
+    const std::shared_ptr<ArrayBuffer>& buffer,
+    double width, double height,
+    const std::string& format) {
+
+    auto promise = Promise<std::shared_ptr<ArrayBuffer>>::create();
+    HaruWorker::getInstance().run<std::shared_ptr<ArrayBuffer>>(promise,
+        [buffer, width, height, format]() {
+            int w = static_cast<int>(width);
+            int h = static_cast<int>(height);
+
+            if (w <= 0 || h <= 0) {
+                throw std::invalid_argument("Width and height must be positive");
+            }
+
+            size_t rgbSize = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
+            std::shared_ptr<ArrayBuffer> rgbBuffer = ArrayBuffer::allocate(rgbSize);
+            uint8_t* rgb = rgbBuffer->data();
+            const uint8_t* yuv = buffer->data();
+
+            auto clamp = [](int v) -> uint8_t {
+                return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+            };
+
+            if (format == "NV12" || format == "nv12") {
+                // NV12: Y plane followed by interleaved UV plane
+                // UV plane: width w (aligned to 2), height (h+1)/2
+                size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
+                size_t uvStride = static_cast<size_t>(w);  // interleaved UV pairs, width aligned to 2
+                size_t uvHeight = (static_cast<size_t>(h) + 1) / 2;
+                size_t uvPlaneSize = uvStride * uvHeight;
+                if (buffer->size() < ySize + uvPlaneSize) {
+                    throw std::invalid_argument("Buffer too small for NV12 format");
+                }
+
+                const uint8_t* yPlane = yuv;
+                const uint8_t* uvPlane = yuv + ySize;
+
+                for (int j = 0; j < h; j++) {
+                    for (int i = 0; i < w; i++) {
+                        int y = yPlane[j * w + i];
+                        size_t uvIndex = (static_cast<size_t>(j / 2) * uvStride) + static_cast<size_t>(i & ~1);
+                        int u = uvPlane[uvIndex] - 128;
+                        int v = uvPlane[uvIndex + 1] - 128;
+
+                        int r = y + ((359 * v) >> 8);
+                        int g = y - ((88 * u + 183 * v) >> 8);
+                        int b = y + ((454 * u) >> 8);
+
+                        size_t idx = (static_cast<size_t>(j) * w + i) * 3;
+                        rgb[idx] = clamp(r);
+                        rgb[idx + 1] = clamp(g);
+                        rgb[idx + 2] = clamp(b);
+                    }
+                }
+            } else if (format == "NV21" || format == "nv21") {
+                // NV21: Y plane followed by interleaved VU plane
+                size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
+                size_t uvStride = static_cast<size_t>(w);
+                size_t uvHeight = (static_cast<size_t>(h) + 1) / 2;
+                size_t uvPlaneSize = uvStride * uvHeight;
+                if (buffer->size() < ySize + uvPlaneSize) {
+                    throw std::invalid_argument("Buffer too small for NV21 format");
+                }
+
+                const uint8_t* yPlane = yuv;
+                const uint8_t* vuPlane = yuv + ySize;
+
+                for (int j = 0; j < h; j++) {
+                    for (int i = 0; i < w; i++) {
+                        int y = yPlane[j * w + i];
+                        size_t uvIndex = (static_cast<size_t>(j / 2) * uvStride) + static_cast<size_t>(i & ~1);
+                        int v = vuPlane[uvIndex] - 128;
+                        int u = vuPlane[uvIndex + 1] - 128;
+
+                        int r = y + ((359 * v) >> 8);
+                        int g = y - ((88 * u + 183 * v) >> 8);
+                        int b = y + ((454 * u) >> 8);
+
+                        size_t idx = (static_cast<size_t>(j) * w + i) * 3;
+                        rgb[idx] = clamp(r);
+                        rgb[idx + 1] = clamp(g);
+                        rgb[idx + 2] = clamp(b);
+                    }
+                }
+            } else if (format == "I420" || format == "i420" || format == "YUV420P" || format == "yuv420p") {
+                // I420: Y plane, then U plane, then V plane
+                // Chroma dimensions: ceil(w/2) x ceil(h/2)
+                size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
+                size_t uvWidth = (static_cast<size_t>(w) + 1) / 2;
+                size_t uvHeight = (static_cast<size_t>(h) + 1) / 2;
+                size_t uvSize = uvWidth * uvHeight;
+                if (buffer->size() < ySize + uvSize * 2) {
+                    throw std::invalid_argument("Buffer too small for I420 format");
+                }
+
+                const uint8_t* yPlane = yuv;
+                const uint8_t* uPlane = yuv + ySize;
+                const uint8_t* vPlane = yuv + ySize + uvSize;
+
+                for (int j = 0; j < h; j++) {
+                    for (int i = 0; i < w; i++) {
+                        int y = yPlane[j * w + i];
+                        size_t chromaIdx = (static_cast<size_t>(j / 2) * uvWidth) + static_cast<size_t>(i / 2);
+                        int u = uPlane[chromaIdx] - 128;
+                        int v = vPlane[chromaIdx] - 128;
+
+                        int r = y + ((359 * v) >> 8);
+                        int g = y - ((88 * u + 183 * v) >> 8);
+                        int b = y + ((454 * u) >> 8);
+
+                        size_t idx = (static_cast<size_t>(j) * w + i) * 3;
+                        rgb[idx] = clamp(r);
+                        rgb[idx + 1] = clamp(g);
+                        rgb[idx + 2] = clamp(b);
+                    }
+                }
+            } else {
+                throw std::invalid_argument("Unsupported YUV format: " + format + ". Use NV12, NV21, or I420.");
+            }
+
+            return rgbBuffer;
+        });
+
+    return promise;
 }
 
 } // namespace margelo::nitro::pdfwriter

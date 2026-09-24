@@ -1,4 +1,4 @@
-import type { HybridObject } from 'react-native-nitro-modules';
+import type { HybridObject, AnyMap } from 'react-native-nitro-modules';
 
 /**
  * NitroPdfWriter exposes libHaru functionality through Nitro Modules.
@@ -205,9 +205,9 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   // ---------------------------------------------------------------------------
   // Annotations
   // ---------------------------------------------------------------------------
-  createTextAnnot(page: number, rect: number[], text: string, encoder?: string): Promise<number>;
-  createLinkAnnot(page: number, rect: number[], dst: number): Promise<number>;
-  createURILinkAnnot(page: number, rect: number[], uri: string): Promise<number>;
+  createTextAnnot(page: number, rect: [number, number, number, number], text: string, encoder?: string): Promise<number>;
+  createLinkAnnot(page: number, rect: [number, number, number, number], dst: number): Promise<number>;
+  createURILinkAnnot(page: number, rect: [number, number, number, number], uri: string): Promise<number>;
 
   // ---------------------------------------------------------------------------
   // Destinations
@@ -255,4 +255,36 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   pageTextWidth(page: number, text: string): Promise<number>;
   pageTextHeight(page: number, text: string): Promise<number>;
   pageMeasureText(page: number, text: string, width: number, wordwrap?: boolean): Promise<number>;
+
+  // ---------------------------------------------------------------------------
+  // Quick Draw (High-level API)
+  // ---------------------------------------------------------------------------
+  /**
+   * Execute a series of PDF operations in a single call.
+   * @param operations Array of operation objects to execute
+   * @param unit Default unit for dimensions ('mm'|'cm'|'in'|'px'|'pt')
+   * @param outputPath Optional file path. Returns path if provided, otherwise returns doc handle.
+   * @param dpi DPI for pixel conversion (default 72)
+   * @returns File path (string) if outputPath provided, otherwise document handle (number)
+   */
+  quickDraw(operations: AnyMap[], unit: string, outputPath?: string, dpi?: number): Promise<string | number>;
+
+  /**
+   * Execute multiple PDF documents in batch.
+   * @param items Array of batch items [{output?, operations, unit?}]
+   * @param dpi DPI for pixel conversion (default 72)
+   * @returns Array of file paths or document handles
+   */
+  quickBatchDraw(items: AnyMap[], dpi?: number): Promise<(string | number)[]>;
+
+  /**
+   * Convert YUV image data to RGB.
+   * Supports NV12, NV21, and I420 (YUV420P) formats.
+   * @param buffer YUV image data as ArrayBuffer
+   * @param width Image width in pixels
+   * @param height Image height in pixels
+   * @param format YUV format: 'NV12', 'NV21', or 'I420'
+   * @returns RGB image data as ArrayBuffer
+   */
+  yuv2rgb(buffer: ArrayBuffer, width: number, height: number, format: 'NV12' | 'NV21' | 'I420' | 'YUV420P'): Promise<ArrayBuffer>;
 }

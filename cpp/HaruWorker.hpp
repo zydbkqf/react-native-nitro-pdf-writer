@@ -2,12 +2,15 @@
 
 #include <NitroModules/Promise.hpp>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <utility>
 
 namespace margelo::nitro::pdfwriter {
 
@@ -32,14 +35,19 @@ public:
    */
   template <typename T, typename Func, std::enable_if_t<!std::is_void_v<T>, int> = 0>
   void run(std::shared_ptr<Promise<T>> promise, Func&& func) {
-    enqueue([promise, func = std::forward<Func>(func)]() mutable {
+    bool queued = enqueue([promise, func = std::forward<Func>(func)]() mutable {
       try {
         T result = func();
         promise->resolve(result);
       } catch (const std::exception&) {
         promise->reject(std::current_exception());
+      } catch (...) {
+        promise->reject(std::current_exception());
       }
     });
+    if (!queued) {
+      promise->reject(std::make_exception_ptr(std::runtime_error("HaruWorker is shut down")));
+    }
   }
 
   /**
@@ -47,14 +55,19 @@ public:
    */
   template <typename Func>
   void run(std::shared_ptr<Promise<void>> promise, Func&& func) {
-    enqueue([promise, func = std::forward<Func>(func)]() mutable {
+    bool queued = enqueue([promise, func = std::forward<Func>(func)]() mutable {
       try {
         func();
         promise->resolve();
       } catch (const std::exception&) {
         promise->reject(std::current_exception());
+      } catch (...) {
+        promise->reject(std::current_exception());
       }
     });
+    if (!queued) {
+      promise->reject(std::make_exception_ptr(std::runtime_error("HaruWorker is shut down")));
+    }
   }
 
   ~HaruWorker();
@@ -62,7 +75,8 @@ public:
 private:
   HaruWorker();
 
-  void enqueue(std::function<void()> task);
+  // Returns false if the worker is shutting down (task was not queued).
+  bool enqueue(std::function<void()> task);
   void loop();
 
   std::thread _thread;

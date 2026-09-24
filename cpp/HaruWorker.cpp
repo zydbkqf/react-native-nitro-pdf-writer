@@ -20,12 +20,16 @@ HaruWorker& HaruWorker::getInstance() {
   return instance;
 }
 
-void HaruWorker::enqueue(std::function<void()> task) {
+bool HaruWorker::enqueue(std::function<void()> task) {
   {
     std::unique_lock<std::mutex> lock(_mutex);
+    if (_stop) {
+      return false;
+    }
     _queue.push(std::move(task));
   }
   _cv.notify_one();
+  return true;
 }
 
 void HaruWorker::loop() {

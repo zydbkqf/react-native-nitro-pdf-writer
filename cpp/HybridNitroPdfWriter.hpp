@@ -7,7 +7,9 @@
 #include <NitroModules/Promise.hpp>
 #include <memory>
 #include <string>
+#include <variant>
 #include <vector>
+#include <unordered_set>
 
 namespace margelo::nitro::pdfwriter {
 
@@ -212,7 +214,23 @@ public:
   std::shared_ptr<Promise<double>> pageMeasureText(double page, const std::string& text, double width,
                                                    std::optional<bool> wordwrap) override;
 
+  // Quick Draw (High-level API)
+  std::shared_ptr<Promise<std::variant<std::string, double>>> quickDraw(
+      const std::vector<std::shared_ptr<AnyMap>>& operations, const std::string& unit,
+      const std::optional<std::string>& outputPath, std::optional<double> dpi) override;
+  std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> quickBatchDraw(
+      const std::vector<std::shared_ptr<AnyMap>>& items, std::optional<double> dpi) override;
+
+  // Utility
+  std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> yuv2rgb(
+      const std::shared_ptr<ArrayBuffer>& buffer,
+      double width, double height,
+      const std::string& format) override;
+
 private:
+  void executeOperation(HPDF_Doc doc, HPDF_Page& page, const std::shared_ptr<AnyMap>& op,
+                       const std::string& defaultUnit, double dpi);
+
   HandleRegistry<HPDF_Doc> _docs;
   HandleRegistry<HPDF_Page> _pages;
   HandleRegistry<HPDF_Font> _fonts;
@@ -221,6 +239,7 @@ private:
   HandleRegistry<HPDF_Outline> _outlines;
   HandleRegistry<HPDF_ExtGState> _extGStates;
   HandleRegistry<HPDF_Annotation> _annotations;
+  std::unordered_set<double> _pagesInTextMode;  // Track pages with active text mode
 };
 
 } // namespace margelo::nitro::pdfwriter
