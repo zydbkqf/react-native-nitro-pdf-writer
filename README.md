@@ -243,14 +243,25 @@ Draw text on the page. If `width` **and** `height` are both provided, text wraps
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | `string` | ✓* | Font name (e.g. `'Helvetica'`, `'Times-Roman'`) |
+| `family` | `string` | ✓* | Font family name |
+| `name` | `string` | ✓* | Alias for `family` |
 | `size` | `number` | ✓ | Font size |
 | `unit` | `Unit` | — | Unit for size |
-| `filePath` | `string` | — | Path to a custom TTF file (alternative to `name`) |
+| `filePath` | `string` | ✓* | Path to a custom TTF file |
+| `media` | `number` | ✓* | Media handle from `loadFontFromFile` / `loadFontFromBuffer` |
 | `encoding` | `string` | — | Character encoding |
 | `fontIndex` | `number` | `0` | Font index in a TTC collection |
+| `embedding` | `boolean` | `true` | Embed custom TTF/TTC in the PDF (quickDraw default; see note below) |
 
-*Either `name` or `filePath` is required.
+*Provide one of `family` (or `name`), `filePath`, or `media`. Missing all of them throws `Font operation requires media, filePath, family or name`.
+
+> **`embedding` defaults differ by API — pass it explicitly if you care.**
+>
+> | Path | Default when omitted |
+> |------|----------------------|
+> | quickDraw `font` / `text.font` | `true` |
+> | `attachFont(doc, media, embedding?)` | `true` |
+> | `loadTTFontFromFile` / `loadTTFontFromFile2` (one-step sugar) | `false` |
 
 #### Color fields
 
@@ -264,19 +275,36 @@ Provide **one** of the following:
 
 ### `image`
 
-Draw a PNG or JPEG image from a file path.
+Draw a PNG or JPEG image from a file path **or** a pre-loaded media handle.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `source` | `string` | ✓ | Local file path to the image |
+| `source` | `string` | ✓* | Local file path to the image |
+| `media` | `number` | ✓* | Media handle from `loadImageFromFile` / `loadImageFromBuffer` (preferred when cached / reused) |
 | `x` | `number` | ✓ | X position |
 | `y` | `number` | ✓ | Y position |
 | `width` | `number` | ✓ | Draw width on the page |
 | `height` | `number` | ✓ | Draw height on the page |
 | `unit` | `Unit` | — | Unit for x/y/width/height |
 | `format` | `'png' \| 'jpeg'` | auto | Force format; auto-detected from file extension if omitted |
+| `useCache` | `boolean` | `false` | Share bytes via the media cache (only for `source`; ignored when `media` is set) |
 
-For binary image data (e.g. from a network request), use `loadPngImageFromBuffer` or `loadRawImageFromBuffer` from the low-level API instead.
+\* Provide **one** of `media` or `source`.
+
+```typescript
+// Preferred: load once, attach into many quickDraw calls / documents
+const logo = await pdf.loadImageFromFile('/path/logo.png', true);
+await quickDraw({
+  operations: [
+    { type: 'image', data: { media: logo, x: 20, y: 270, width: 40, height: 40 } },
+  ],
+});
+
+// Sugar: one-shot from a path
+{ type: 'image', data: { source: '/path/photo.jpg', x: 20, y: 200, width: 100, height: 80 } }
+```
+
+For binary image data (e.g. from a network request), use `loadImageFromBuffer` and pass the returned handle as `media`.
 
 ### `line`
 
@@ -356,11 +384,24 @@ Set the current font for subsequent text operations.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | `string` | ✓* | Base-14 font name or loaded custom font name |
+| `family` | `string` | ✓* | Font family name (e.g. `'Helvetica'`, `'Times-Roman'`) |
+| `name` | `string` | ✓* | Alias for `family` |
 | `size` | `number` | ✓ | Font size |
-| `filePath` | `string` | — | Path to TTF/TTC file (alternative to `name`) |
-| `fontIndex` | `number` | `0` | Font index in a TTC collection |
+| `filePath` | `string` | ✓* | Path to TTF/TTC file |
+| `media` | `number` | ✓* | Media handle from `loadFontFromFile` / `loadFontFromBuffer` (preferred) |
+| `fontIndex` | `number` | `0` | Font index in a TTC collection (`filePath` only) |
 | `encoding` | `string` | — | Character encoding |
+| `embedding` | `boolean` | `true` | Embed the TTF/TTC in the PDF (quickDraw `font` default; one-step `loadTTFontFromFile*` defaults to `false`) |
+
+\* Provide **one** of `family` (or `name`), `filePath`, or `media`. Missing all of them throws `Font operation requires media, filePath, family or name`.
+
+```typescript
+const font = await pdf.loadFontFromFile('/path/NotoSans.ttf');
+{
+  type: 'font',
+  data: { media: font, size: 12, embedding: true },
+}
+```
 
 ### `color`
 
@@ -461,6 +502,10 @@ Passing a value outside `0..1` raises `HPDF_PAGE_OUT_OF_RANGE`.
 
 libharu does not have a default font. You must obtain a font handle and set it on the page **before** calling `textOut`, `textRect`, `measureText`, or similar text methods.
 
+> **Note:** `HPDF_Font` handles are bound to a single document and cannot be reused across
+> PDFs. What *is* shared is the font **pre-parse** (file bytes, glyph metrics, TTC face index),
+> which runs outside the global lock and is cached by path + mtime + size.
+
 ```typescript
 const fontHandle = await pdf.getFont(docHandle, 'Helvetica');
 await pdf.setFontAndSize(pageHandle, fontHandle, 24);
@@ -468,10 +513,26 @@ await pdf.setFontAndSize(pageHandle, fontHandle, 24);
 
 Built-in (base-14) font names: `Courier`, `Courier-Bold`, `Courier-Oblique`, `Courier-BoldOblique`, `Helvetica`, `Helvetica-Bold`, `Helvetica-Oblique`, `Helvetica-BoldOblique`, `Times-Roman`, `Times-Bold`, `Times-Italic`, `Times-BoldItalic`, `Symbol`, `ZapfDingbats`.
 
-You can also load custom fonts from files:
+### Custom fonts — two-step load / attach (preferred when reusing)
 
 ```typescript
-// Load TTF font
+// load: file → buffer + pre-parse (TTC index, glyph metrics) outside the global lock
+const fontMedia = await pdf.loadFontFromFile('/path/to/NotoSans.ttf');
+// or: await pdf.loadFontFromBuffer(ttfArrayBuffer, /* faceIndex */ 0);
+
+// attach: install into one document (HPDF_Font is doc-bound)
+const fontA = await pdf.attachFont(docA, fontMedia, /* embedding */ true);
+const fontB = await pdf.attachFont(docB, fontMedia, true); // same media, another PDF
+
+await pdf.setFontAndSize(pageA, fontA, 24);
+
+await pdf.freeMedia(fontMedia); // drop the prepared handle; fontA/fontB stay valid
+```
+
+### Custom fonts — one-step sugar
+
+```typescript
+// Load TTF font (embedding defaults to false — pass true to embed)
 const ttFont = await pdf.loadTTFontFromFile(docHandle, '/path/to/font.ttf', true);
 await pdf.setFontAndSize(pageHandle, ttFont, 24);
 
@@ -645,10 +706,207 @@ await pdf.resetError(docHandle); // clear the error state
 
 ## Threading and Safety
 
-- Every libharu operation runs on a dedicated background thread via `HaruWorker`.
-- A global `std::mutex` (`HaruLock`) serializes all libharu calls, because libharu is not thread-safe.
+- PDF drawing APIs run on a dedicated background thread (`HaruWorker`).
+- A global `std::mutex` (`HaruLock`) serializes all `HPDF_*` calls, because libharu is not thread-safe.
+- **Font / image parsing runs outside that lock** on a separate media worker pool (`MediaWorker`):
+  - file byte reading
+  - TTC face-index parsing
+  - glyph-metric pre-parse (`head` / `maxp` / `hhea` / `hmtx` / `name`)
+  - PNG/JPEG header parse
+- Only the brief `HPDF_Load*` / `HPDF_GetFont` install step takes `HaruLock`.
 - The JavaScript side receives promises and never blocks the React Native UI thread.
-- Concurrent calls from JS are safe — they are queued and serialized natively.
+- Concurrent calls from JS are safe — libharu work is serialized natively; media prep can overlap.
+
+## Two-step load / attach (images & fonts)
+
+Split media handling into **load** (file → buffer, parse outside the global lock) and
+**attach** (install into one document). A single loaded media handle can be attached
+to many PDF documents — ideal for shared logos and fonts.
+
+```typescript
+// Load once (reads file / accepts buffer, pre-parses outside HaruLock)
+const logo = await pdf.loadImageFromFile('/path/logo.png', /* useCache */ true);
+const font = await pdf.loadFontFromFile('/path/NotoSans.ttf');
+
+const docA = await pdf.createDocument();
+const docB = await pdf.createDocument();
+
+// Attach the same media to multiple documents (HPDF handles stay doc-bound)
+const imgA = await pdf.attachImage(docA, logo);
+const imgB = await pdf.attachImage(docB, logo);
+const fontA = await pdf.attachFont(docA, font, /* embedding */ true);
+const fontB = await pdf.attachFont(docB, font, true);
+
+// Release the prepared handle when no longer attaching
+await pdf.freeMedia(logo);
+await pdf.freeMedia(font);
+```
+
+**Lifetime rules**
+
+| Action | Effect |
+|--------|--------|
+| `load*` | Returns a **media handle** (not doc-bound). Safe to attach many times. |
+| `attach*` | Creates a **doc-bound** `HPDF_Image` / `HPDF_Font`. That handle stays valid as long as the document lives. |
+| `freeMedia` | Invalidates the media handle — later `attach*` calls fail. **Does not** tear down images/fonts already attached to documents. |
+| Re-`freeMedia` / unknown handle | Safe no-op. |
+
+```typescript
+const logo = await pdf.loadImageFromFile('/path/logo.png');
+await pdf.attachImage(doc, logo);
+await pdf.freeMedia(logo);
+// await pdf.attachImage(doc, logo); // ❌ media handle is gone
+// previously returned image handle from attachImage is still usable ✅
+```
+
+| Load API | Source | Notes |
+|----------|--------|-------|
+| `loadImageFromFile(fileName, useCache?)` | file → buffer | PNG/JPEG auto-detected from extension |
+| `loadImageFromBuffer(buffer, format, width, height, colorSpace, useCache?)` | buffer | `format`: `'png' \| 'jpeg' \| 'raw'` |
+| `loadFontFromFile(fileName, faceIndex?)` | file → buffer | TTC index + glyph metrics pre-parsed |
+| `loadFontFromBuffer(buffer, faceIndex?)` | buffer | Materializes a temp file for libharu |
+
+| Attach API | Result |
+|------------|--------|
+| `attachImage(doc, media)` | doc-bound image handle |
+| `attachFont(doc, media, embedding?)` | doc-bound font handle (**`embedding` defaults to `true`**; one-step `loadTTFontFromFile*` defaults to `false`) |
+| `freeMedia(media)` | drop the prepared handle |
+
+### One-step sugar
+
+The classic calls remain and are equivalent to `load* + attach*` (the intermediate
+media handle is not retained):
+
+```typescript
+await pdf.loadPngImageFromBuffer(doc, pngBuffer, useCache?);
+await pdf.loadPngImageFromFile(doc, path);
+await pdf.loadJpegImageFromFile(doc, path);
+await pdf.loadRawImageFromBuffer(doc, pixels, w, h, cs, useCache?);
+await pdf.loadRawImageFromFile(doc, path, w, h, cs);
+await pdf.loadTTFontFromFile(doc, path, embedding?);
+await pdf.loadTTFontFromFile2(doc, path, index, embedding?);
+```
+
+### Using media handles in `quickDraw`
+
+`image`, `font`, and `text.font` all accept `media: number` from `loadImage*` / `loadFont*`.
+That is the path that covers **cached** assets — the handle refers to the shared prepared
+blob (file bytes + metrics / image bytes), not a path that would be re-read.
+
+```typescript
+const logo = await pdf.loadImageFromFile('/path/logo.png', /* useCache */ true);
+const titleFont = await pdf.loadFontFromFile('/path/Inter.ttf');
+
+await quickDraw({
+  unit: 'mm',
+  output: '/path/out.pdf',
+  operations: [
+    { type: 'image', data: { media: logo, x: 20, y: 250, width: 40, height: 40 } },
+    {
+      type: 'text',
+      data: {
+        content: 'Invoice',
+        x: 20, y: 270,
+        font: { media: titleFont, size: 18, embedding: true },
+      },
+    },
+    { type: 'font', data: { media: titleFont, size: 10 } },
+  ],
+});
+
+await pdf.freeMedia(logo);
+await pdf.freeMedia(titleFont);
+```
+
+`source` / `filePath` still work and are sugar for load+attach inside the call.
+When `media` is present it wins — no file I/O happens.
+
+## Media Cache
+
+The media cache stores **document-independent** prepared data so repeated loads are cheap:
+
+| Cached payload | Shared across documents? | Notes |
+|----------------|--------------------------|-------|
+| Font file bytes + glyph metrics + TTC face index | Yes (the pre-parse) | `HPDF_Font` itself is document-bound and is **not** shared |
+| Image source bytes (PNG/JPEG/raw) | Yes | Installed per document via `*FromMem` |
+
+> ⚠️ **Do not over-use the cache.** It is designed for assets you actually reuse across
+> multiple PDF documents (letterhead logos, CJK fonts, shared photos). Caching one-off
+> images just fills the LRU and adds hashing/copy overhead. Prefer the default
+> (`useCache: false`) unless you have a measured need.
+
+### `useCache` (default `false`)
+
+Opt in per call:
+
+```typescript
+// Low-level buffer APIs
+await pdf.loadPngImageFromBuffer(doc, pngBuffer, /* useCache */ true);
+await pdf.loadRawImageFromBuffer(doc, pixels, w, h, 0, /* useCache */ true);
+
+// Quick Draw image operation
+await quickDraw({
+  operations: [
+    {
+      type: 'image',
+      data: { source: '/path/logo.png', x: 20, y: 270, width: 40, height: 40, useCache: true },
+    },
+  ],
+});
+```
+
+Font pre-parse (file bytes, glyph metrics, TTC index) is always shared through the cache —
+that work is pure CPU/IO and is identical for every document.
+
+### Cache keys and version checks
+
+| Source | Key includes |
+|--------|----------------|
+| File | path + **mtime** + size (a rewritten file is a new key — stale data is never reused) |
+| Buffer | **content hash** + width + height + colorSpace |
+
+### Limits and eviction
+
+- Hard cap on **total payload bytes** (default **32 MiB**).
+- **LRU** eviction among unpinned entries.
+- Entries are **reference-counted**: `get()` pins, dropping the result unpins. Pinned entries are never evicted mid-use.
+
+```typescript
+await pdf.setMediaCacheLimit(16 * 1024 * 1024); // 16 MiB
+const stats = await pdf.getMediaCacheStats();   // { entries, totalBytes, maxBytes }
+await pdf.clearMediaCache();                    // release everything (memory + disk)
+```
+
+### `cacheDir` (Android / iOS)
+
+Optional disk backing under a platform cache directory. Keys still carry mtime/content
+version, so a changed source file is never served from disk.
+
+```typescript
+// Manual (works on any platform)
+import { NitroPdfWriterInstance as pdf } from 'react-native-nitro-pdf-writer';
+await pdf.setCacheDir('/path/to/cache/nitro-pdf-writer');
+```
+
+Native auto-wiring (can be overridden by `setCacheDir`):
+
+| Platform | Default |
+|----------|---------|
+| Android | `context.cacheDir/nitro-pdf-writer` (set from `NitroPdfWriterPackage`) |
+| iOS | `Caches/nitro-pdf-writer` (set on library load) |
+
+You can also set it explicitly from app code:
+
+```kotlin
+// Android
+import com.margelo.nitro.pdfwriter.NitroPdfWriterCacheDir
+NitroPdfWriterCacheDir.set(context.cacheDir.absolutePath + "/nitro-pdf-writer")
+```
+
+```typescript
+// iOS — pass any writable directory
+await pdf.setCacheDir(`${RNFS.CachesDirectoryPath}/nitro-pdf-writer`);
+```
 
 ## Memory Management
 
@@ -756,10 +1014,12 @@ All methods return `Promise<T>`.
 | Method | Signature |
 |--------|-----------|
 | `getFont` | `(doc: number, fontName: string, encodingName?: string) → Promise<number>` |
-| `getFont2` | `(doc: number, fontName: string, encodingName?: string) → Promise<number>` |
-| `loadType1FontFromFile` | `(doc: number, afmPath: string, pfmPath?: string) → Promise<number>` |
-| `loadTTFontFromFile` | `(doc: number, fileName: string, embedding?: boolean) → Promise<number>` |
-| `loadTTFontFromFile2` | `(doc: number, fileName: string, index: number, embedding?: boolean) → Promise<number>` |
+| `loadFontFromFile` | `(fileName: string, faceIndex?: number) → Promise<number>` — two-step load |
+| `loadFontFromBuffer` | `(buffer: ArrayBuffer, faceIndex?: number) → Promise<number>` — two-step load |
+| `attachFont` | `(doc: number, media: number, embedding?: boolean) → Promise<number>` — **`embedding` defaults to `true`** |
+| `loadType1FontFromFile` | `(doc: number, afmPath: string, pfmPath?: string) → Promise<number>` — sugar |
+| `loadTTFontFromFile` | `(doc: number, fileName: string, embedding?: boolean) → Promise<number>` — sugar, **`embedding` defaults to `false`** |
+| `loadTTFontFromFile2` | `(doc: number, fileName: string, index: number, embedding?: boolean) → Promise<number>` — sugar, **`embedding` defaults to `false`** |
 | `setFontAndSize` | `(page: number, font: number, size: number) → Promise<void>` |
 | `getFontName` | `(font: number) → Promise<string>` |
 | ~~`setCurrentFont`~~ | *Deprecated — throws. Use `setFontAndSize` instead.* |
@@ -852,11 +1112,15 @@ All methods return `Promise<T>`.
 
 | Method | Signature |
 |--------|-----------|
-| `loadPngImageFromFile` | `(doc: number, fileName: string) → Promise<number>` |
-| `loadPngImageFromBuffer` | `(doc: number, buffer: ArrayBuffer) → Promise<number>` |
-| `loadJpegImageFromFile` | `(doc: number, fileName: string) → Promise<number>` |
-| `loadRawImageFromFile` | `(doc: number, fileName: string, width, height, colorSpace) → Promise<number>` |
-| `loadRawImageFromBuffer` | `(doc: number, buffer: ArrayBuffer, width, height, colorSpace) → Promise<number>` |
+| `loadImageFromFile` | `(fileName: string, useCache?: boolean) → Promise<number>` — two-step load |
+| `loadImageFromBuffer` | `(buffer: ArrayBuffer, format: string, width, height, colorSpace, useCache?: boolean) → Promise<number>` |
+| `attachImage` | `(doc: number, media: number) → Promise<number>` |
+| `freeMedia` | `(media: number) → Promise<void>` |
+| `loadPngImageFromFile` | `(doc: number, fileName: string) → Promise<number>` — sugar |
+| `loadPngImageFromBuffer` | `(doc: number, buffer: ArrayBuffer, useCache?: boolean) → Promise<number>` — sugar |
+| `loadJpegImageFromFile` | `(doc: number, fileName: string) → Promise<number>` — sugar |
+| `loadRawImageFromFile` | `(doc: number, fileName: string, width, height, colorSpace) → Promise<number>` — sugar |
+| `loadRawImageFromBuffer` | `(doc: number, buffer: ArrayBuffer, width, height, colorSpace, useCache?: boolean) → Promise<number>` — sugar |
 | `setImageMask` | `(image: number, mask: number) → Promise<void>` |
 | `drawImage` | `(page: number, image: number, x, y, width, height) → Promise<void>` |
 | `drawRawImage` | `(page: number, buffer: ArrayBuffer, width, height, colorSpace, x, y, drawWidth, drawHeight) → Promise<void>` |
@@ -914,6 +1178,15 @@ All methods return `Promise<T>`.
 | `pageTextWidth` | `(page: number, text: string) → Promise<number>` |
 | `pageTextHeight` | `(page: number, text: string) → Promise<number>` |
 | `pageMeasureText` | `(page: number, text: string, width: number, wordwrap?: boolean) → Promise<number>` |
+
+### Media Cache
+
+| Method | Signature |
+|--------|-----------|
+| `setCacheDir` | `(path: string) → Promise<void>` |
+| `clearMediaCache` | `() → Promise<void>` |
+| `setMediaCacheLimit` | `(maxBytes: number) → Promise<void>` |
+| `getMediaCacheStats` | `() → Promise<AnyMap>` — `{ entries, totalBytes, maxBytes }` |
 
 ### Quick Draw
 
@@ -991,6 +1264,18 @@ yarn test
 # C++ unit tests
 yarn test:cpp
 ```
+
+C++ coverage includes the two-step load / attach pipeline (`cpp/tests/test_load_attach.cpp`):
+
+| Scenario | What is asserted |
+|----------|------------------|
+| **Cross-document media reuse** | One media handle attaches to several `HPDF_Doc`s; `HPDF_Font` / `HPDF_Image` stay doc-bound and distinct |
+| **`useCache: true`** | Repeated loads share one prepared blob (content-hash / mtime keys) |
+| **`useCache: false`** | Loads stay independent and do not grow `MediaCache` |
+| **`freeMedia`** | Handle cannot be resolved afterwards; already-attached doc handles remain valid |
+| **Idempotent free** | Unknown / double `freeMedia` is a safe no-op |
+
+Also covered: `MediaCache` LRU + byte cap + pin/refcount, `FontPrep` TTC index & glyph metrics, `HaruLock` serialization.
 
 ## Dependencies
 

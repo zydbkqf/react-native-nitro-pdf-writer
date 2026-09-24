@@ -51,6 +51,10 @@ add_library(
   NitroPdfWriter
   SHARED
   ../cpp/HaruWorker.cpp
+  ../cpp/MediaWorker.cpp
+  ../cpp/MediaCache.cpp
+  ../cpp/MediaPrep.cpp
+  ../cpp/FontPrep.cpp
   ../cpp/HybridNitroPdfWriter.cpp
   ../nitrogen/generated/shared/c++/HybridNitroPdfWriterSpec.cpp
   cpp-adapter.cpp

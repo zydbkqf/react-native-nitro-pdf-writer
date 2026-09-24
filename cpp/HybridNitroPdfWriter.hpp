@@ -3,10 +3,13 @@
 #include "HandleRegistry.hpp"
 #include "HaruWorker.hpp"
 #include "HybridNitroPdfWriterSpec.hpp"
+#include "MediaCache.hpp"
+#include <NitroModules/AnyMap.hpp>
 #include <NitroModules/ArrayBuffer.hpp>
 #include <NitroModules/Promise.hpp>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 #include <unordered_set>
@@ -58,6 +61,14 @@ public:
   // Fonts
   std::shared_ptr<Promise<double>> getFont(double doc, const std::string& fontName,
                                            const std::optional<std::string>& encodingName) override;
+  // Two-step: load (file/buffer → media handle, pre-parse outside lock) + attach (to doc)
+  std::shared_ptr<Promise<double>> loadFontFromFile(const std::string& fileName,
+                                                    std::optional<double> faceIndex) override;
+  std::shared_ptr<Promise<double>> loadFontFromBuffer(const std::shared_ptr<ArrayBuffer>& buffer,
+                                                      std::optional<double> faceIndex) override;
+  std::shared_ptr<Promise<double>> attachFont(double doc, double media,
+                                              std::optional<bool> embedding) override;
+  // Sugar (load + attach)
   std::shared_ptr<Promise<double>> loadType1FontFromFile(double doc, const std::string& afmPath,
                                                          const std::optional<std::string>& pfmPath) override;
   std::shared_ptr<Promise<double>> loadTTFontFromFile(double doc, const std::string& fileName,
@@ -141,10 +152,21 @@ public:
   std::shared_ptr<Promise<void>> closePathEofillStroke(double page) override;
   std::shared_ptr<Promise<void>> endPath(double page) override;
 
-  // Images
+  // Images — two-step load / attach
+  std::shared_ptr<Promise<double>> loadImageFromFile(const std::string& fileName,
+                                                     std::optional<bool> useCache) override;
+  std::shared_ptr<Promise<double>> loadImageFromBuffer(const std::shared_ptr<ArrayBuffer>& buffer,
+                                                       const std::string& format, double width,
+                                                       double height, double colorSpace,
+                                                       std::optional<bool> useCache) override;
+  std::shared_ptr<Promise<double>> attachImage(double doc, double media) override;
+  std::shared_ptr<Promise<void>> freeMedia(double media) override;
+
+  // Sugar (load + attach)
   std::shared_ptr<Promise<double>> loadPngImageFromFile(double doc, const std::string& fileName) override;
   std::shared_ptr<Promise<double>> loadPngImageFromBuffer(double doc,
-                                                          const std::shared_ptr<ArrayBuffer>& buffer) override;
+                                                          const std::shared_ptr<ArrayBuffer>& buffer,
+                                                          std::optional<bool> useCache) override;
   std::shared_ptr<Promise<double>> loadJpegImageFromFile(double doc, const std::string& fileName) override;
   std::shared_ptr<Promise<double>> loadRawImageFromFile(double doc, const std::string& fileName,
                                                         double width, double height,
@@ -152,7 +174,8 @@ public:
   std::shared_ptr<Promise<double>> loadRawImageFromBuffer(double doc,
                                                           const std::shared_ptr<ArrayBuffer>& buffer,
                                                           double width, double height,
-                                                          double colorSpace) override;
+                                                          double colorSpace,
+                                                          std::optional<bool> useCache) override;
   std::shared_ptr<Promise<void>> setImageMask(double image, double mask) override;
   std::shared_ptr<Promise<void>> drawImage(double page, double image, double x, double y,
                                            double width, double height) override;
@@ -214,6 +237,12 @@ public:
   std::shared_ptr<Promise<double>> pageMeasureText(double page, const std::string& text, double width,
                                                    std::optional<bool> wordwrap) override;
 
+  // Media cache (shared font pre-parse / image bytes across documents)
+  std::shared_ptr<Promise<void>> setCacheDir(const std::string& path) override;
+  std::shared_ptr<Promise<void>> clearMediaCache() override;
+  std::shared_ptr<Promise<void>> setMediaCacheLimit(double maxBytes) override;
+  std::shared_ptr<Promise<std::shared_ptr<AnyMap>>> getMediaCacheStats() override;
+
   // Quick Draw (High-level API)
   std::shared_ptr<Promise<std::variant<std::string, double>>> quickDraw(
       const std::vector<std::shared_ptr<AnyMap>>& operations, const std::string& unit,
@@ -225,11 +254,25 @@ public:
   std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> yuv2rgb(
       const std::shared_ptr<ArrayBuffer>& buffer,
       double width, double height,
-      const std::string& format) override;
+      YuvFormat format) override;
+
+  /** Pre-parsed file sources for one quickDraw call (filled outside HaruLock). */
+  struct QuickDrawMedia {
+    // source path -> prepared image/font blob (parsed outside HaruLock)
+    std::unordered_map<std::string, std::shared_ptr<MediaBlob>> images;
+    std::unordered_map<std::string, std::shared_ptr<MediaBlob>> fonts;
+  };
 
 private:
+  // Shared install helpers (HaruLock must be held).
+  double installImageBlob(HPDF_Doc doc, const std::shared_ptr<MediaBlob>& blob);
+  double installFontBlob(HPDF_Doc doc, const std::shared_ptr<MediaBlob>& blob,
+                         std::optional<bool> embedding,
+                         const char* encoding = nullptr);
+
   void executeOperation(HPDF_Doc doc, HPDF_Page& page, const std::shared_ptr<AnyMap>& op,
-                       const std::string& defaultUnit, double dpi);
+                       const std::string& defaultUnit, double dpi,
+                       const QuickDrawMedia* media = nullptr);
 
   HandleRegistry<HPDF_Doc> _docs;
   HandleRegistry<HPDF_Page> _pages;
@@ -239,6 +282,7 @@ private:
   HandleRegistry<HPDF_Outline> _outlines;
   HandleRegistry<HPDF_ExtGState> _extGStates;
   HandleRegistry<HPDF_Annotation> _annotations;
+  MediaRegistry _media;
   std::unordered_set<double> _pagesInTextMode;  // Track pages with active text mode
 };
 

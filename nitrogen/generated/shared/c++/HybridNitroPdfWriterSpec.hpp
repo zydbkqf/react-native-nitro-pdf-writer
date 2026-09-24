@@ -13,15 +13,18 @@
 #error NitroModules cannot be found! Are you sure you installed NitroModules properly?
 #endif
 
-
+// Forward declaration of `YuvFormat` to properly resolve imports.
+namespace margelo::nitro::pdfwriter { enum class YuvFormat; }
 
 #include <NitroModules/Promise.hpp>
 #include <string>
 #include <NitroModules/ArrayBuffer.hpp>
 #include <optional>
 #include <vector>
-#include <variant>
+#include <tuple>
 #include <NitroModules/AnyMap.hpp>
+#include <variant>
+#include "YuvFormat.hpp"
 
 namespace margelo::nitro::pdfwriter {
 
@@ -77,6 +80,9 @@ namespace margelo::nitro::pdfwriter {
       virtual std::shared_ptr<Promise<void>> setSize(double page, double size, double direction) = 0;
       virtual std::shared_ptr<Promise<void>> setRotate(double page, double angle) = 0;
       virtual std::shared_ptr<Promise<double>> getFont(double doc, const std::string& fontName, const std::optional<std::string>& encodingName) = 0;
+      virtual std::shared_ptr<Promise<double>> loadFontFromFile(const std::string& fileName, std::optional<double> faceIndex) = 0;
+      virtual std::shared_ptr<Promise<double>> loadFontFromBuffer(const std::shared_ptr<ArrayBuffer>& buffer, std::optional<double> faceIndex) = 0;
+      virtual std::shared_ptr<Promise<double>> attachFont(double doc, double media, std::optional<bool> embedding) = 0;
       virtual std::shared_ptr<Promise<double>> loadType1FontFromFile(double doc, const std::string& afmPath, const std::optional<std::string>& pfmPath) = 0;
       virtual std::shared_ptr<Promise<double>> loadTTFontFromFile(double doc, const std::string& fileName, std::optional<bool> embedding) = 0;
       virtual std::shared_ptr<Promise<double>> loadTTFontFromFile2(double doc, const std::string& fileName, double index, std::optional<bool> embedding) = 0;
@@ -129,20 +135,24 @@ namespace margelo::nitro::pdfwriter {
       virtual std::shared_ptr<Promise<void>> closePathFillStroke(double page) = 0;
       virtual std::shared_ptr<Promise<void>> closePathEofillStroke(double page) = 0;
       virtual std::shared_ptr<Promise<void>> endPath(double page) = 0;
+      virtual std::shared_ptr<Promise<double>> loadImageFromFile(const std::string& fileName, std::optional<bool> useCache) = 0;
+      virtual std::shared_ptr<Promise<double>> loadImageFromBuffer(const std::shared_ptr<ArrayBuffer>& buffer, const std::string& format, double width, double height, double colorSpace, std::optional<bool> useCache) = 0;
+      virtual std::shared_ptr<Promise<double>> attachImage(double doc, double media) = 0;
+      virtual std::shared_ptr<Promise<void>> freeMedia(double media) = 0;
       virtual std::shared_ptr<Promise<double>> loadPngImageFromFile(double doc, const std::string& fileName) = 0;
-      virtual std::shared_ptr<Promise<double>> loadPngImageFromBuffer(double doc, const std::shared_ptr<ArrayBuffer>& buffer) = 0;
+      virtual std::shared_ptr<Promise<double>> loadPngImageFromBuffer(double doc, const std::shared_ptr<ArrayBuffer>& buffer, std::optional<bool> useCache) = 0;
       virtual std::shared_ptr<Promise<double>> loadJpegImageFromFile(double doc, const std::string& fileName) = 0;
       virtual std::shared_ptr<Promise<double>> loadRawImageFromFile(double doc, const std::string& fileName, double width, double height, double colorSpace) = 0;
-      virtual std::shared_ptr<Promise<double>> loadRawImageFromBuffer(double doc, const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, double colorSpace) = 0;
+      virtual std::shared_ptr<Promise<double>> loadRawImageFromBuffer(double doc, const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, double colorSpace, std::optional<bool> useCache) = 0;
       virtual std::shared_ptr<Promise<void>> setImageMask(double image, double mask) = 0;
       virtual std::shared_ptr<Promise<void>> drawImage(double page, double image, double x, double y, double width, double height) = 0;
       virtual std::shared_ptr<Promise<void>> drawRawImage(double page, const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, double colorSpace, double x, double y, double drawWidth, double drawHeight) = 0;
       virtual std::shared_ptr<Promise<void>> gSave(double page) = 0;
       virtual std::shared_ptr<Promise<void>> gRestore(double page) = 0;
       virtual std::shared_ptr<Promise<void>> concat(double page, double a, double b, double c, double d, double x, double y) = 0;
-      virtual std::shared_ptr<Promise<double>> createTextAnnot(double page, const std::vector<double>& rect, const std::string& text, const std::optional<std::string>& encoder) = 0;
-      virtual std::shared_ptr<Promise<double>> createLinkAnnot(double page, const std::vector<double>& rect, double dst) = 0;
-      virtual std::shared_ptr<Promise<double>> createURILinkAnnot(double page, const std::vector<double>& rect, const std::string& uri) = 0;
+      virtual std::shared_ptr<Promise<double>> createTextAnnot(double page, const std::tuple<double, double, double, double>& rect, const std::string& text, const std::optional<std::string>& encoder) = 0;
+      virtual std::shared_ptr<Promise<double>> createLinkAnnot(double page, const std::tuple<double, double, double, double>& rect, double dst) = 0;
+      virtual std::shared_ptr<Promise<double>> createURILinkAnnot(double page, const std::tuple<double, double, double, double>& rect, const std::string& uri) = 0;
       virtual std::shared_ptr<Promise<double>> createDestination(double page) = 0;
       virtual std::shared_ptr<Promise<void>> setDestinationXYZ(double dst, double x, double y, double zoom) = 0;
       virtual std::shared_ptr<Promise<void>> setDestinationFit(double dst) = 0;
@@ -164,9 +174,13 @@ namespace margelo::nitro::pdfwriter {
       virtual std::shared_ptr<Promise<double>> pageTextWidth(double page, const std::string& text) = 0;
       virtual std::shared_ptr<Promise<double>> pageTextHeight(double page, const std::string& text) = 0;
       virtual std::shared_ptr<Promise<double>> pageMeasureText(double page, const std::string& text, double width, std::optional<bool> wordwrap) = 0;
+      virtual std::shared_ptr<Promise<void>> setCacheDir(const std::string& path) = 0;
+      virtual std::shared_ptr<Promise<void>> clearMediaCache() = 0;
+      virtual std::shared_ptr<Promise<void>> setMediaCacheLimit(double maxBytes) = 0;
+      virtual std::shared_ptr<Promise<std::shared_ptr<AnyMap>>> getMediaCacheStats() = 0;
       virtual std::shared_ptr<Promise<std::variant<std::string, double>>> quickDraw(const std::vector<std::shared_ptr<AnyMap>>& operations, const std::string& unit, const std::optional<std::string>& outputPath, std::optional<double> dpi) = 0;
       virtual std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> quickBatchDraw(const std::vector<std::shared_ptr<AnyMap>>& items, std::optional<double> dpi) = 0;
-      virtual std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> yuv2rgb(const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, const std::string& format) = 0;
+      virtual std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> yuv2rgb(const std::shared_ptr<ArrayBuffer>& buffer, double width, double height, YuvFormat format) = 0;
 
     protected:
       // Hybrid Setup

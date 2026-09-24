@@ -1,10 +1,14 @@
 import type { HybridObject, AnyMap } from 'react-native-nitro-modules';
 
+/** YUV layout understood by yuv2rgb. */
+export type YuvFormat = 'NV12' | 'NV21' | 'I420' | 'YUV420P';
+
 /**
  * NitroPdfWriter exposes libHaru functionality through Nitro Modules.
  * All methods return Promises so that work can be off-loaded from the UI thread.
- * libHaru itself is not thread-safe; the native implementation serializes
- * every call behind a single global lock and a dedicated worker thread.
+ * libHaru itself is not thread-safe; HPDF_* calls are serialized behind a global
+ * lock. Font/image file I/O and parsing run on a separate media worker outside
+ * that lock, and optional caching can share prepared bytes across documents.
  */
 export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++' }> {
   // ---------------------------------------------------------------------------
@@ -53,6 +57,22 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   // Fonts
   // ---------------------------------------------------------------------------
   getFont(doc: number, fontName: string, encodingName?: string): Promise<number>;
+  /**
+   * Two-step font API — load: read file → buffer, pre-parse TTC index + glyph
+   * metrics outside the global lock. Returns a media handle (not doc-bound).
+   * Attach with `attachFont`. One media handle can be attached to many documents.
+   */
+  loadFontFromFile(fileName: string, faceIndex?: number): Promise<number>;
+  /** Two-step font API — load from an in-memory TTF/TTC buffer. */
+  loadFontFromBuffer(buffer: ArrayBuffer, faceIndex?: number): Promise<number>;
+  /**
+   * Two-step font API — attach a loaded font media handle to a document.
+   * Returns a doc-bound HPDF_Font handle. The media handle stays valid for
+   * attaching to further documents until `freeMedia`.
+   */
+  attachFont(doc: number, media: number, embedding?: boolean): Promise<number>;
+
+  // Sugar (load + attach in one call)
   loadType1FontFromFile(doc: number, afmPath: string, pfmPath?: string): Promise<number>;
   loadTTFontFromFile(doc: number, fileName: string, embedding?: boolean): Promise<number>;
   loadTTFontFromFile2(doc: number, fileName: string, index: number, embedding?: boolean): Promise<number>;
@@ -149,8 +169,43 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   // ---------------------------------------------------------------------------
   // Images
   // ---------------------------------------------------------------------------
+  /**
+   * Two-step image API — load: read file → buffer + parse headers outside the
+   * global lock. Auto-detects PNG/JPEG from the extension. Returns a media handle.
+   * @param useCache Share the payload via MediaCache across documents (default false).
+   */
+  loadImageFromFile(fileName: string, useCache?: boolean): Promise<number>;
+  /**
+   * Two-step image API — load from an in-memory buffer.
+   * @param format 'png' | 'jpeg' | 'raw'
+   * @param width/height/colorSpace Required for 'raw'; ignored for png/jpeg.
+   */
+  loadImageFromBuffer(
+    buffer: ArrayBuffer,
+    format: string,
+    width: number,
+    height: number,
+    colorSpace: number,
+    useCache?: boolean,
+  ): Promise<number>;
+  /**
+   * Two-step image API — install a loaded media handle into a document.
+   * Returns a doc-bound HPDF_Image handle. The media handle remains valid for
+   * more documents until `freeMedia`.
+   */
+  attachImage(doc: number, media: number): Promise<number>;
+  /** Release a prepared media handle from loadFont / loadImage. */
+  freeMedia(media: number): Promise<void>;
+
+  // Sugar (load + attach in one call)
   loadPngImageFromFile(doc: number, fileName: string): Promise<number>;
-  loadPngImageFromBuffer(doc: number, buffer: ArrayBuffer): Promise<number>;
+  /**
+   * Sugar: loadImageFromBuffer('png') + attachImage.
+   * @param useCache When true (default false), the decoded payload is stored in the
+   *   shared media cache so the same buffer can be reused across multiple documents
+   *   without re-parsing. Cache key includes a content hash + geometry.
+   */
+  loadPngImageFromBuffer(doc: number, buffer: ArrayBuffer, useCache?: boolean): Promise<number>;
   loadJpegImageFromFile(doc: number, fileName: string): Promise<number>;
   loadRawImageFromFile(
     doc: number,
@@ -159,12 +214,17 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
     height: number,
     colorSpace: number,
   ): Promise<number>;
+  /**
+   * Sugar: loadImageFromBuffer('raw') + attachImage.
+   * @param useCache When true (default false), shares the payload via the media cache.
+   */
   loadRawImageFromBuffer(
     doc: number,
     buffer: ArrayBuffer,
     width: number,
     height: number,
     colorSpace: number,
+    useCache?: boolean,
   ): Promise<number>;
   setImageMask(image: number, mask: number): Promise<void>;
   drawImage(page: number, image: number, x: number, y: number, width: number, height: number): Promise<void>;
@@ -257,6 +317,22 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   pageMeasureText(page: number, text: string, width: number, wordwrap?: boolean): Promise<number>;
 
   // ---------------------------------------------------------------------------
+  // Media cache
+  // ---------------------------------------------------------------------------
+  /**
+   * Set the disk directory used to persist the media cache (optional).
+   * On Android pass `context.cacheDir`, on iOS pass the Caches directory.
+   * Keys include source mtime / content hash so stale files are never reused.
+   */
+  setCacheDir(path: string): Promise<void>;
+  /** Release every cached font pre-parse / image payload (memory + disk). */
+  clearMediaCache(): Promise<void>;
+  /** Set the cache byte cap (LRU eviction). Default is 32 MiB. */
+  setMediaCacheLimit(maxBytes: number): Promise<void>;
+  /** Snapshot: { entries, totalBytes, maxBytes }. */
+  getMediaCacheStats(): Promise<AnyMap>;
+
+  // ---------------------------------------------------------------------------
   // Quick Draw (High-level API)
   // ---------------------------------------------------------------------------
   /**
@@ -286,5 +362,5 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
    * @param format YUV format: 'NV12', 'NV21', or 'I420'
    * @returns RGB image data as ArrayBuffer
    */
-  yuv2rgb(buffer: ArrayBuffer, width: number, height: number, format: 'NV12' | 'NV21' | 'I420' | 'YUV420P'): Promise<ArrayBuffer>;
+  yuv2rgb(buffer: ArrayBuffer, width: number, height: number, format: YuvFormat): Promise<ArrayBuffer>;
 }

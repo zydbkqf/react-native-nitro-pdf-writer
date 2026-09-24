@@ -1,6 +1,9 @@
 #include "HybridNitroPdfWriter.hpp"
+#include "FontPrep.hpp"
 #include "HaruError.hpp"
 #include "HaruLock.hpp"
+#include "MediaPrep.hpp"
+#include "MediaWorker.hpp"
 #include <NitroModules/ArrayBuffer.hpp>
 #include <algorithm>
 #include <cmath>
@@ -152,6 +155,7 @@ HybridNitroPdfWriter::~HybridNitroPdfWriter() {
   _outlines.clear();
   _extGStates.clear();
   _annotations.clear();
+  _media.clear();
 }
 
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createDocument() {
@@ -477,10 +481,111 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::getFont(double doc, const
   return promise;
 }
 
+// ---------------------------------------------------------------------------
+// Font / image install helpers (HaruLock held)
+// ---------------------------------------------------------------------------
+
+double HybridNitroPdfWriter::installImageBlob(HPDF_Doc doc, const std::shared_ptr<MediaBlob>& blob) {
+  if (!blob) {
+    throw std::invalid_argument("Invalid media handle");
+  }
+  HPDF_Image image = nullptr;
+  switch (blob->kind) {
+    case MediaBlob::Kind::Png:
+      image = HPDF_LoadPngImageFromMem(doc, blob->bytes.data(),
+                                       static_cast<HPDF_UINT>(blob->bytes.size()));
+      break;
+    case MediaBlob::Kind::Jpeg:
+      image = HPDF_LoadJpegImageFromMem(doc, blob->bytes.data(),
+                                        static_cast<HPDF_UINT>(blob->bytes.size()));
+      break;
+    case MediaBlob::Kind::Raw:
+      image = HPDF_LoadRawImageFromMem(doc, blob->bytes.data(),
+                                       static_cast<HPDF_UINT>(blob->width),
+                                       static_cast<HPDF_UINT>(blob->height),
+                                       static_cast<HPDF_ColorSpace>(blob->colorSpace), 8);
+      break;
+    default:
+      throw std::invalid_argument("Media handle is not an image");
+  }
+  throwHaruError(doc);
+  return _images.registerPointer(image, doc);
+}
+
+double HybridNitroPdfWriter::installFontBlob(HPDF_Doc doc, const std::shared_ptr<MediaBlob>& blob,
+                                             std::optional<bool> embedding,
+                                             const char* encoding) {
+  if (!blob || blob->kind != MediaBlob::Kind::Font) {
+    throw std::invalid_argument("Media handle is not a font");
+  }
+  if (blob->fontPath.empty()) {
+    throw std::runtime_error("Font media has no load path");
+  }
+  // attachFont / quickDraw default embedding=true (see PdfTypes). One-step
+  // sugar passes an explicit value to preserve historical defaults.
+  HPDF_BOOL embed = embedding.value_or(HPDF_TRUE);
+  const char* fontName = nullptr;
+  if (blob->isTtc) {
+    fontName = HPDF_LoadTTFontFromFile2(doc, blob->fontPath.c_str(), blob->faceIndex, embed);
+  } else {
+    fontName = HPDF_LoadTTFontFromFile(doc, blob->fontPath.c_str(), embed);
+  }
+  throwHaruError(doc);
+  if (!fontName) throw std::runtime_error("Failed to load font");
+  HPDF_Font font = HPDF_GetFont(doc, fontName, encoding);
+  throwHaruError(doc);
+  return _fonts.registerPointer(font, doc);
+}
+
+// ---------------------------------------------------------------------------
+// Fonts — two-step load / attach
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadFontFromFile(
+    const std::string& fileName, std::optional<double> faceIndex) {
+  auto promise = Promise<double>::create();
+  uint32_t face = static_cast<uint32_t>(faceIndex.value_or(0));
+  if (faceIndex.has_value() && *faceIndex < 0) face = 0;
+  MediaWorker::getInstance().run<double>(promise, [this, fileName, face]() {
+    // Outside HaruLock: read bytes, TTC index, glyph metrics.
+    auto blob = FontPrep::loadFromFile(fileName, face);
+    return _media.registerBlob(blob);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadFontFromBuffer(
+    const std::shared_ptr<ArrayBuffer>& buffer, std::optional<double> faceIndex) {
+  auto promise = Promise<double>::create();
+  uint32_t face = static_cast<uint32_t>(faceIndex.value_or(0));
+  if (faceIndex.has_value() && *faceIndex < 0) face = 0;
+  MediaWorker::getInstance().run<double>(promise, [this, buffer, face]() {
+    auto blob = FontPrep::loadFromBuffer(buffer->data(), buffer->size(), face,
+                                         /*useCache=*/false);
+    return _media.registerBlob(blob);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::attachFont(double doc, double media,
+                                                                  std::optional<bool> embedding) {
+  auto promise = Promise<double>::create();
+  MediaWorker::getInstance().run<double>(promise, [this, doc, media, embedding]() {
+    auto blob = _media.get(media);
+    std::lock_guard<std::mutex> lock(HaruLock::get());
+    Handle<HPDF_Doc> h(doc, _docs);
+    return installFontBlob(h.get(), blob, embedding);
+  });
+  return promise;
+}
+
+// --- Font sugar (load + attach in one call) ---
+
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadType1FontFromFile(double doc,
                                                                        const std::string& afmPath,
                                                                        const std::optional<std::string>& pfmPath) {
   auto promise = Promise<double>::create();
+  // Type1 AFM/PFM have no useful cross-doc pre-parse; install directly.
   HaruWorker::getInstance().run<double>(promise, [this, doc, afmPath, pfmPath]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
@@ -497,35 +602,22 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadType1FontFromFile(dou
 
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadTTFontFromFile(double doc, const std::string& fileName,
                                                                     std::optional<bool> embedding) {
-  auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, fileName, embedding]() {
-    std::lock_guard<std::mutex> lock(HaruLock::get());
-    Handle<HPDF_Doc> h(doc, _docs);
-    HPDF_BOOL embed = embedding.value_or(HPDF_FALSE);
-    const char* fontName = HPDF_LoadTTFontFromFile(h.get(), fileName.c_str(), embed);
-    throwHaruError(h.get());
-    if (!fontName) throw std::runtime_error("Failed to load font");
-    HPDF_Font font = HPDF_GetFont(h.get(), fontName, nullptr);
-    throwHaruError(h.get());
-    return _fonts.registerPointer(font, h.get());
-  });
-  return promise;
+  return loadTTFontFromFile2(doc, fileName, 0, embedding);
 }
 
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadTTFontFromFile2(double doc, const std::string& fileName,
                                                                      double index,
                                                                      std::optional<bool> embedding) {
   auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, fileName, index, embedding]() {
+  uint32_t faceIndex = static_cast<uint32_t>(index < 0 ? 0 : index);
+  // Sugar = loadFontFromFile + attachFont. Keep historical default (embed=false)
+  // for this one-step API; attachFont defaults to true.
+  bool embed = embedding.value_or(false);
+  MediaWorker::getInstance().run<double>(promise, [this, doc, fileName, faceIndex, embed]() {
+    std::shared_ptr<MediaBlob> prep = FontPrep::loadFromFile(fileName, faceIndex);
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
-    HPDF_BOOL embed = embedding.value_or(HPDF_FALSE);
-    const char* fontName = HPDF_LoadTTFontFromFile2(h.get(), fileName.c_str(), static_cast<HPDF_UINT>(index), embed);
-    throwHaruError(h.get());
-    if (!fontName) throw std::runtime_error("Failed to load font");
-    HPDF_Font font = HPDF_GetFont(h.get(), fontName, nullptr);
-    throwHaruError(h.get());
-    return _fonts.registerPointer(font, h.get());
+    return installFontBlob(h.get(), prep, embed);
   });
   return promise;
 }
@@ -1127,40 +1219,107 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::endPath(double page) {
 // Images
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadPngImageFromFile(double doc, const std::string& fileName) {
+// ---------------------------------------------------------------------------
+// Images — two-step load / attach
+// ---------------------------------------------------------------------------
+
+static MediaBlob::Kind parseImageFormat(const std::string& format) {
+  if (format == "jpeg" || format == "jpg" || format == "JPEG" || format == "JPG") {
+    return MediaBlob::Kind::Jpeg;
+  }
+  if (format == "raw" || format == "RAW") {
+    return MediaBlob::Kind::Raw;
+  }
+  return MediaBlob::Kind::Png;
+}
+
+static MediaBlob::Kind detectImageKind(const std::string& path) {
+  std::string ext = std::filesystem::path(path).extension().string();
+  std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+  return (ext == ".jpg" || ext == ".jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
+}
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadImageFromFile(const std::string& fileName,
+                                                                         std::optional<bool> useCache) {
   auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, fileName]() {
+  bool cache = useCache.value_or(false);
+  MediaWorker::getInstance().run<double>(promise, [this, fileName, cache]() {
+    MediaBlob::Kind kind = detectImageKind(fileName);
+    auto blob = MediaPrep::prepareImageFile(fileName, kind, cache);
+    return _media.registerBlob(blob);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadImageFromBuffer(
+    const std::shared_ptr<ArrayBuffer>& buffer, const std::string& format, double width,
+    double height, double colorSpace, std::optional<bool> useCache) {
+  auto promise = Promise<double>::create();
+  bool cache = useCache.value_or(false);
+  MediaBlob::Kind kind = parseImageFormat(format);
+  MediaWorker::getInstance().run<double>(promise, [this, buffer, kind, width, height, colorSpace, cache]() {
+    auto blob = MediaPrep::prepareImageBuffer(
+        buffer->data(), buffer->size(), kind, static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height), static_cast<int>(colorSpace), cache);
+    return _media.registerBlob(blob);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::attachImage(double doc, double media) {
+  auto promise = Promise<double>::create();
+  MediaWorker::getInstance().run<double>(promise, [this, doc, media]() {
+    auto blob = _media.get(media);
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
-    HPDF_Image image = HPDF_LoadPngImageFromFile(h.get(), fileName.c_str());
-    throwHaruError(h.get());
-    return _images.registerPointer(image, h.get());
+    return installImageBlob(h.get(), blob);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<void>> HybridNitroPdfWriter::freeMedia(double media) {
+  auto promise = Promise<void>::create();
+  HaruWorker::getInstance().run(promise, [this, media]() {
+    _media.release(media);
+  });
+  return promise;
+}
+
+// --- Image sugar (load + attach in one call) ---
+
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadPngImageFromFile(double doc, const std::string& fileName) {
+  auto promise = Promise<double>::create();
+  MediaWorker::getInstance().run<double>(promise, [this, doc, fileName]() {
+    auto blob = MediaPrep::prepareImageFile(fileName, MediaBlob::Kind::Png, /*useCache=*/false);
+    std::lock_guard<std::mutex> lock(HaruLock::get());
+    Handle<HPDF_Doc> h(doc, _docs);
+    return installImageBlob(h.get(), blob);
   });
   return promise;
 }
 
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadPngImageFromBuffer(double doc,
-                                                                        const std::shared_ptr<ArrayBuffer>& buffer) {
+                                                                        const std::shared_ptr<ArrayBuffer>& buffer,
+                                                                        std::optional<bool> useCache) {
   auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, buffer]() {
+  bool cache = useCache.value_or(false);
+  MediaWorker::getInstance().run<double>(promise, [this, doc, buffer, cache]() {
+    auto blob = MediaPrep::prepareImageBuffer(buffer->data(), buffer->size(), MediaBlob::Kind::Png,
+                                              0, 0, 0, cache);
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
-    HPDF_Image image = HPDF_LoadPngImageFromMem(h.get(), buffer->data(),
-                                                static_cast<HPDF_UINT>(buffer->size()));
-    throwHaruError(h.get());
-    return _images.registerPointer(image, h.get());
+    return installImageBlob(h.get(), blob);
   });
   return promise;
 }
 
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadJpegImageFromFile(double doc, const std::string& fileName) {
   auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, fileName]() {
+  MediaWorker::getInstance().run<double>(promise, [this, doc, fileName]() {
+    auto blob = MediaPrep::prepareImageFile(fileName, MediaBlob::Kind::Jpeg, /*useCache=*/false);
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
-    HPDF_Image image = HPDF_LoadJpegImageFromFile(h.get(), fileName.c_str());
-    throwHaruError(h.get());
-    return _images.registerPointer(image, h.get());
+    return installImageBlob(h.get(), blob);
   });
   return promise;
 }
@@ -1169,14 +1328,14 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromFile(doub
                                                                       double width, double height,
                                                                       double colorSpace) {
   auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, fileName, width, height, colorSpace]() {
+  MediaWorker::getInstance().run<double>(promise, [this, doc, fileName, width, height, colorSpace]() {
+    auto blob = MediaPrep::prepareImageFile(fileName, MediaBlob::Kind::Raw, /*useCache=*/false);
+    blob->width = static_cast<uint32_t>(width);
+    blob->height = static_cast<uint32_t>(height);
+    blob->colorSpace = static_cast<int>(colorSpace);
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
-    HPDF_Image image = HPDF_LoadRawImageFromFile(h.get(), fileName.c_str(), static_cast<HPDF_UINT>(width),
-                                                 static_cast<HPDF_UINT>(height),
-                                                 static_cast<HPDF_ColorSpace>(colorSpace));
-    throwHaruError(h.get());
-    return _images.registerPointer(image, h.get());
+    return installImageBlob(h.get(), blob);
   });
   return promise;
 }
@@ -1184,11 +1343,11 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromFile(doub
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromBuffer(double doc,
                                                                         const std::shared_ptr<ArrayBuffer>& buffer,
                                                                         double width, double height,
-                                                                        double colorSpace) {
+                                                                        double colorSpace,
+                                                                        std::optional<bool> useCache) {
   auto promise = Promise<double>::create();
-  HaruWorker::getInstance().run<double>(promise, [this, doc, buffer, width, height, colorSpace]() {
-    std::lock_guard<std::mutex> lock(HaruLock::get());
-    Handle<HPDF_Doc> h(doc, _docs);
+  bool cache = useCache.value_or(false);
+  MediaWorker::getInstance().run<double>(promise, [this, doc, buffer, width, height, colorSpace, cache]() {
     if (width <= 0 || height <= 0) {
       throw std::invalid_argument("Width and height must be positive");
     }
@@ -1205,13 +1364,13 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromBuffer(do
     if (buffer->size() < expected) {
       throw std::invalid_argument("Buffer too small for raw image data");
     }
-    HPDF_Image image = HPDF_LoadRawImageFromMem(h.get(), buffer->data(),
-                                                static_cast<HPDF_UINT>(width),
-                                                static_cast<HPDF_UINT>(height),
-                                                static_cast<HPDF_ColorSpace>(colorSpace),
-                                                8);
-    throwHaruError(h.get());
-    return _images.registerPointer(image, h.get());
+    auto blob = MediaPrep::prepareImageBuffer(buffer->data(), buffer->size(), MediaBlob::Kind::Raw,
+                                              static_cast<uint32_t>(width),
+                                              static_cast<uint32_t>(height),
+                                              static_cast<int>(colorSpace), cache);
+    std::lock_guard<std::mutex> lock(HaruLock::get());
+    Handle<HPDF_Doc> h(doc, _docs);
+    return installImageBlob(h.get(), blob);
   });
   return promise;
 }
@@ -1706,7 +1865,7 @@ static HPDF_LineJoin getLineJoin(const std::string& join) {
 
 void HybridNitroPdfWriter::executeOperation(
     HPDF_Doc doc, HPDF_Page& page, const std::shared_ptr<AnyMap>& op,
-    const std::string& defaultUnit, double dpi) {
+    const std::string& defaultUnit, double dpi, const QuickDrawMedia* media) {
 
     std::string type = op->getString("type");
     if (type.empty()) return;
@@ -1748,20 +1907,38 @@ void HybridNitroPdfWriter::executeOperation(
     else if (type == "font" && op->contains("data")) {
         auto data = op->getObject("data");
 
+        // Explicit guard — must run before any data.at(...) so a missing
+        // identifier does not surface as an opaque map::at error.
+        if (!data.contains("media") && !data.contains("filePath") && !data.contains("family") &&
+            !data.contains("name")) {
+            throw std::invalid_argument("Font operation requires media, filePath, family or name");
+        }
+
         double fontSize = anyToDouble(data.at("size"));
 
         std::string unit = data.contains("unit") ? anyToString(data.at("unit")) : defaultUnit;
         fontSize = convertToPt(fontSize, unit, dpi);
 
+        std::string encodingStr;
+        const char* encoding = nullptr;
+        if (data.contains("encoding")) {
+          encodingStr = anyToString(data.at("encoding"));
+          encoding = encodingStr.c_str();
+        }
+
         HPDF_Font font = nullptr;
-        if (data.contains("filePath")) {
-            std::string path = anyToString(data.at("filePath"));
-            std::string encodingStr;
-            const char* encoding = nullptr;
-            if (data.contains("encoding")) {
-              encodingStr = anyToString(data.at("encoding"));
-              encoding = encodingStr.c_str();
+        if (data.contains("media")) {
+            // Two-step API: attach a pre-loaded (optionally cached) font media handle.
+            double mediaHandle = anyToDouble(data.at("media"));
+            auto blob = _media.get(mediaHandle);
+            if (!blob) {
+                throw std::invalid_argument("Invalid font media handle (already freed?)");
             }
+            bool embed = !data.contains("embedding") || anyToBool(data.at("embedding"));
+            double fontHandle = installFontBlob(doc, blob, embed, encoding);
+            font = _fonts.getPointer(fontHandle);
+        } else if (data.contains("filePath")) {
+            std::string path = anyToString(data.at("filePath"));
 
             std::string ext = path.length() >= 4 ? path.substr(path.length() - 4) : "";
             std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -1769,24 +1946,25 @@ void HybridNitroPdfWriter::executeOperation(
                 throw std::runtime_error("OTF fonts with CFF outlines are not supported by libharu. Please convert to TTF or use a TTC file instead.");
             }
 
-            const char* fontNameCStr = nullptr;
-            if (ext == ".ttc") {
-                HPDF_UINT index = data.contains("fontIndex") ? static_cast<HPDF_UINT>(anyToDouble(data.at("fontIndex"))) : 0;
-                fontNameCStr = HPDF_LoadTTFontFromFile2(doc, path.c_str(), index, HPDF_TRUE);
-            } else {
-                fontNameCStr = HPDF_LoadTTFontFromFile(doc, path.c_str(), HPDF_TRUE);
+            HPDF_UINT index = data.contains("fontIndex") ? static_cast<HPDF_UINT>(anyToDouble(data.at("fontIndex"))) : 0;
+            // Prefer pre-parsed TTC index / glyph metrics from the media prep pass.
+            std::shared_ptr<MediaBlob> prep;
+            if (media != nullptr) {
+                std::string key = path + "#" + std::to_string(index);
+                auto it = media->fonts.find(key);
+                if (it != media->fonts.end()) prep = it->second;
             }
-            throwHaruError(doc);
-            if (!fontNameCStr) throw std::runtime_error("Failed to load font");
-            font = HPDF_GetFont(doc, fontNameCStr, encoding);
+            if (!prep) {
+                prep = FontPrep::loadFromFile(path, index);
+            }
+
+            bool embed = !data.contains("embedding") || anyToBool(data.at("embedding"));
+            double fontHandle = installFontBlob(doc, prep, embed, encoding);
+            font = _fonts.getPointer(fontHandle);
         } else {
-            std::string fontName = anyToString(data.at("name"));
-            std::string encodingStr;
-            const char* encoding = nullptr;
-            if (data.contains("encoding")) {
-              encodingStr = anyToString(data.at("encoding"));
-              encoding = encodingStr.c_str();
-            }
+            // `family` is the preferred key; `name` kept as an alias.
+            std::string fontName = data.contains("family") ? anyToString(data.at("family"))
+                                                           : anyToString(data.at("name"));
             font = HPDF_GetFont(doc, fontName.c_str(), encoding);
         }
         throwHaruError(doc);
@@ -1828,13 +2006,53 @@ void HybridNitroPdfWriter::executeOperation(
         double y = convertToPt(anyToDouble(data.at("y")), unit, dpi);
 
         if (data.contains("font")) {
-            auto font = std::get<AnyObject>(data.at("font"));
-            std::string fontName = anyToString(font.at("name"));
-            double fontSize = anyToDouble(font.at("size"));
-            std::string fontUnit = font.contains("unit") ? anyToString(font.at("unit")) : unit;
+            auto fontObj = std::get<AnyObject>(data.at("font"));
+
+            if (fontObj.find("media") == fontObj.end() && fontObj.find("filePath") == fontObj.end() &&
+                fontObj.find("family") == fontObj.end() && fontObj.find("name") == fontObj.end()) {
+                throw std::invalid_argument("Font operation requires media, filePath, family or name");
+            }
+
+            double fontSize = anyToDouble(fontObj.at("size"));
+            std::string fontUnit = fontObj.contains("unit") ? anyToString(fontObj.at("unit")) : unit;
             fontSize = convertToPt(fontSize, fontUnit, dpi);
 
-            HPDF_Font hFont = HPDF_GetFont(doc, fontName.c_str(), nullptr);
+            HPDF_Font hFont = nullptr;
+            if (fontObj.contains("media")) {
+                double mediaHandle = anyToDouble(fontObj.at("media"));
+                auto blob = _media.get(mediaHandle);
+                if (!blob) {
+                    throw std::invalid_argument("Invalid font media handle (already freed?)");
+                }
+                std::string encodingStr;
+                const char* encoding = nullptr;
+                if (fontObj.contains("encoding")) {
+                    encodingStr = anyToString(fontObj.at("encoding"));
+                    encoding = encodingStr.c_str();
+                }
+                bool embed = !fontObj.contains("embedding") || anyToBool(fontObj.at("embedding"));
+                double fontHandle = installFontBlob(doc, blob, embed, encoding);
+                hFont = _fonts.getPointer(fontHandle);
+            } else if (fontObj.contains("filePath")) {
+                std::string path = anyToString(fontObj.at("filePath"));
+                HPDF_UINT index = fontObj.contains("fontIndex")
+                    ? static_cast<HPDF_UINT>(anyToDouble(fontObj.at("fontIndex"))) : 0;
+                std::shared_ptr<MediaBlob> prep;
+                if (media != nullptr) {
+                    auto it = media->fonts.find(path + "#" + std::to_string(index));
+                    if (it != media->fonts.end()) prep = it->second;
+                }
+                if (!prep) {
+                    prep = FontPrep::loadFromFile(path, index);
+                }
+                bool embed = !fontObj.contains("embedding") || anyToBool(fontObj.at("embedding"));
+                double fontHandle = installFontBlob(doc, prep, embed, nullptr);
+                hFont = _fonts.getPointer(fontHandle);
+            } else {
+                std::string fontName = fontObj.contains("family") ? anyToString(fontObj.at("family"))
+                                                                  : anyToString(fontObj.at("name"));
+                hFont = HPDF_GetFont(doc, fontName.c_str(), nullptr);
+            }
             throwHaruError(doc);
             HPDF_Page_SetFontAndSize(page, hFont, static_cast<HPDF_REAL>(fontSize));
             throwHaruError(doc);
@@ -1885,27 +2103,45 @@ void HybridNitroPdfWriter::executeOperation(
         double width = convertToPt(anyToDouble(data.at("width")), unit, dpi);
         double height = convertToPt(anyToDouble(data.at("height")), unit, dpi);
 
-        std::string source = anyToString(data.at("source"));
+        if (!data.contains("source") && !data.contains("media")) {
+            throw std::invalid_argument("Image operation requires source or media");
+        }
 
-        HPDF_Image image;
-        std::string format = data.contains("format") ? anyToString(data.at("format")) : "";
-
-        if (!format.empty()) {
-            if (format == "jpeg") {
-                image = HPDF_LoadJpegImageFromFile(doc, source.c_str());
-            } else {
-                image = HPDF_LoadPngImageFromFile(doc, source.c_str());
+        std::shared_ptr<MediaBlob> blob;
+        if (data.contains("media")) {
+            // Two-step API: attach a pre-loaded (optionally cached) image media handle.
+            double mediaHandle = anyToDouble(data.at("media"));
+            blob = _media.get(mediaHandle);
+            if (!blob) {
+                throw std::invalid_argument("Invalid image media handle (already freed?)");
             }
         } else {
-            std::string ext = std::filesystem::path(source).extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            if (ext == ".jpg" || ext == ".jpeg") {
-                image = HPDF_LoadJpegImageFromFile(doc, source.c_str());
+            std::string source = anyToString(data.at("source"));
+            bool useCache = data.contains("useCache") && anyToBool(data.at("useCache"));
+            std::string format = data.contains("format") ? anyToString(data.at("format")) : "";
+
+            MediaBlob::Kind kind = MediaBlob::Kind::Png;
+            if (!format.empty()) {
+                kind = (format == "jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
             } else {
-                image = HPDF_LoadPngImageFromFile(doc, source.c_str());
+                std::string ext = std::filesystem::path(source).extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                kind = (ext == ".jpg" || ext == ".jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
+            }
+
+            // Prefer the media prep pass (I/O + header parse already done outside the lock).
+            if (media != nullptr) {
+                auto it = media->images.find(source);
+                if (it != media->images.end()) blob = it->second;
+            }
+            if (!blob) {
+                blob = MediaPrep::prepareImageFile(source, kind, useCache);
             }
         }
-        throwHaruError(doc);
+
+        double imageHandle = installImageBlob(doc, blob);
+        HPDF_Image image = _images.getPointer(imageHandle);
+        if (!image) throw std::runtime_error("Failed to load image");
 
         HPDF_Page_DrawImage(page, image, static_cast<HPDF_REAL>(x), static_cast<HPDF_REAL>(y),
                            static_cast<HPDF_REAL>(width), static_cast<HPDF_REAL>(height));
@@ -2237,16 +2473,69 @@ void HybridNitroPdfWriter::executeOperation(
     }
 }
 
+// Pre-parse file-based image/font sources outside HaruLock. Ops that already
+// carry a `media` handle skip this — the blob lives in MediaRegistry.
+static void preparseQuickDrawOps(const std::vector<std::shared_ptr<AnyMap>>& operations,
+                                 HybridNitroPdfWriter::QuickDrawMedia& media) {
+  auto prepFontData = [&](const AnyObject& obj) {
+    if (obj.find("media") != obj.end()) {
+      return; // already loaded via loadFontFrom*
+    }
+    if (obj.find("filePath") == obj.end()) {
+      return;
+    }
+    std::string path = anyToString(obj.at("filePath"));
+    HPDF_UINT index =
+        obj.find("fontIndex") != obj.end() ? static_cast<HPDF_UINT>(anyToDouble(obj.at("fontIndex"))) : 0;
+    media.fonts[path + "#" + std::to_string(index)] = FontPrep::loadFromFile(path, index);
+  };
+
+  for (const auto& op : operations) {
+    if (!op->contains("type")) continue;
+    std::string type = op->getString("type");
+    if (type == "image" && op->contains("data")) {
+      auto data = op->getObject("data");
+      if (data.find("media") != data.end()) continue; // already loaded
+      if (data.find("source") == data.end()) continue;
+      std::string source = anyToString(data.at("source"));
+      bool useCache = data.contains("useCache") && anyToBool(data.at("useCache"));
+      std::string format = data.contains("format") ? anyToString(data.at("format")) : "";
+      MediaBlob::Kind kind = MediaBlob::Kind::Png;
+      if (!format.empty()) {
+        kind = (format == "jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
+      } else {
+        std::string ext = std::filesystem::path(source).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        kind = (ext == ".jpg" || ext == ".jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
+      }
+      media.images[source] = MediaPrep::prepareImageFile(source, kind, useCache);
+    } else if (type == "font" && op->contains("data")) {
+      prepFontData(op->getObject("data"));
+    } else if (type == "text" && op->contains("data")) {
+      auto data = op->getObject("data");
+      if (data.find("font") != data.end()) {
+        auto fontVal = data.at("font");
+        if (std::holds_alternative<AnyObject>(fontVal)) {
+          prepFontData(std::get<AnyObject>(fontVal));
+        }
+      }
+    }
+  }
+}
+
 std::shared_ptr<Promise<std::variant<std::string, double>>> HybridNitroPdfWriter::quickDraw(
     const std::vector<std::shared_ptr<AnyMap>>& operations, const std::string& unit,
     const std::optional<std::string>& outputPath, std::optional<double> dpi) {
 
     auto promise = Promise<std::variant<std::string, double>>::create();
-    HaruWorker::getInstance().run<std::variant<std::string, double>>(promise,
+    // MediaWorker: pre-parse fonts/images OUTSIDE HaruLock, then install under the lock.
+    MediaWorker::getInstance().run<std::variant<std::string, double>>(promise,
         [this, operations, unit, outputPath, dpi]() {
-            std::lock_guard<std::mutex> lock(HaruLock::get());
-
             double dpiVal = dpi.value_or(72.0);
+            QuickDrawMedia media;
+            preparseQuickDrawOps(operations, media);
+
+            std::lock_guard<std::mutex> lock(HaruLock::get());
 
             // Create document
             HPDF_Doc doc = HPDF_New(nullptr, nullptr);
@@ -2264,7 +2553,7 @@ std::shared_ptr<Promise<std::variant<std::string, double>>> HybridNitroPdfWriter
                         throwHaruError(doc);
                     }
                     // executeOperation takes page by reference; "page" ops create a new page internally
-                    executeOperation(doc, page, op, unit, dpiVal);
+                    executeOperation(doc, page, op, unit, dpiVal, &media);
                 }
 
                 if (outputPath.has_value()) {
@@ -2291,10 +2580,8 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
     const std::vector<std::shared_ptr<AnyMap>>& items, std::optional<double> dpi) {
 
     auto promise = Promise<std::vector<std::variant<std::string, double>>>::create();
-    HaruWorker::getInstance().run<std::vector<std::variant<std::string, double>>>(promise,
+    MediaWorker::getInstance().run<std::vector<std::variant<std::string, double>>>(promise,
         [this, items, dpi]() {
-            std::lock_guard<std::mutex> lock(HaruLock::get());
-
             double dpiVal = dpi.value_or(72.0);
             std::vector<std::variant<std::string, double>> results;
 
@@ -2328,6 +2615,12 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
                         outputPath = item->getString("output");
                     }
 
+                    // Pre-parse fonts/images outside HaruLock (shared cache across batch items).
+                    QuickDrawMedia media;
+                    preparseQuickDrawOps(ops, media);
+
+                    std::lock_guard<std::mutex> lock(HaruLock::get());
+
                     // Create document
                     HPDF_Doc doc = HPDF_New(nullptr, nullptr);
                     if (doc == nullptr) {
@@ -2343,7 +2636,7 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
                                 page = HPDF_AddPage(doc);
                                 throwHaruError(doc);
                             }
-                            executeOperation(doc, page, op, unit, dpiVal);
+                            executeOperation(doc, page, op, unit, dpiVal, &media);
                         }
 
                         if (outputPath.has_value()) {
@@ -2377,7 +2670,7 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
 std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv2rgb(
     const std::shared_ptr<ArrayBuffer>& buffer,
     double width, double height,
-    const std::string& format) {
+    YuvFormat format) {
 
     auto promise = Promise<std::shared_ptr<ArrayBuffer>>::create();
     HaruWorker::getInstance().run<std::shared_ptr<ArrayBuffer>>(promise,
@@ -2398,7 +2691,7 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv
                 return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
             };
 
-            if (format == "NV12" || format == "nv12") {
+            if (format == YuvFormat::NV12) {
                 // NV12: Y plane followed by interleaved UV plane
                 // UV plane: width w (aligned to 2), height (h+1)/2
                 size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
@@ -2429,7 +2722,7 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv
                         rgb[idx + 2] = clamp(b);
                     }
                 }
-            } else if (format == "NV21" || format == "nv21") {
+            } else if (format == YuvFormat::NV21) {
                 // NV21: Y plane followed by interleaved VU plane
                 size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
                 size_t uvStride = static_cast<size_t>(w);
@@ -2459,7 +2752,7 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv
                         rgb[idx + 2] = clamp(b);
                     }
                 }
-            } else if (format == "I420" || format == "i420" || format == "YUV420P" || format == "yuv420p") {
+            } else if (format == YuvFormat::I420 || format == YuvFormat::YUV420P) {
                 // I420: Y plane, then U plane, then V plane
                 // Chroma dimensions: ceil(w/2) x ceil(h/2)
                 size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
@@ -2492,13 +2785,54 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv
                     }
                 }
             } else {
-                throw std::invalid_argument("Unsupported YUV format: " + format + ". Use NV12, NV21, or I420.");
+                throw std::invalid_argument("Unsupported YUV format");
             }
 
             return rgbBuffer;
         });
 
     return promise;
+}
+
+// ---------------------------------------------------------------------------
+// Media cache
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Promise<void>> HybridNitroPdfWriter::setCacheDir(const std::string& path) {
+  auto promise = Promise<void>::create();
+  HaruWorker::getInstance().run(promise, [path]() {
+    MediaCache::instance().setCacheDir(path);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<void>> HybridNitroPdfWriter::clearMediaCache() {
+  auto promise = Promise<void>::create();
+  HaruWorker::getInstance().run(promise, []() {
+    MediaCache::instance().clear();
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<void>> HybridNitroPdfWriter::setMediaCacheLimit(double maxBytes) {
+  auto promise = Promise<void>::create();
+  HaruWorker::getInstance().run(promise, [maxBytes]() {
+    MediaCache::instance().trimTo(maxBytes > 0 ? static_cast<size_t>(maxBytes) : 0);
+  });
+  return promise;
+}
+
+std::shared_ptr<Promise<std::shared_ptr<AnyMap>>> HybridNitroPdfWriter::getMediaCacheStats() {
+  auto promise = Promise<std::shared_ptr<AnyMap>>::create();
+  HaruWorker::getInstance().run<std::shared_ptr<AnyMap>>(promise, []() {
+    auto& cache = MediaCache::instance();
+    auto map = AnyMap::make();
+    map->setDouble("entries", static_cast<double>(cache.entryCount()));
+    map->setDouble("totalBytes", static_cast<double>(cache.totalBytes()));
+    map->setDouble("maxBytes", static_cast<double>(cache.maxBytes()));
+    return map;
+  });
+  return promise;
 }
 
 } // namespace margelo::nitro::pdfwriter

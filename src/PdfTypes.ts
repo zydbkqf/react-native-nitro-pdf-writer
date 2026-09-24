@@ -5,12 +5,26 @@
 export type Unit = 'mm' | 'cm' | 'in' | 'px' | 'pt';
 
 export interface Font {
+  /** Font family / PostScript name (e.g. `'Helvetica'`). Alias: `family`. */
   name?: string;
+  /** Preferred alias for `name`. Provide one of `family` | `name` | `filePath` | `media`. */
+  family?: string;
   size: number;
   unit?: Unit;
   filePath?: string;
+  /**
+   * Media handle from `loadFontFromFile` / `loadFontFromBuffer`.
+   * Preferred over `filePath` when the font was pre-loaded (and optionally cached).
+   */
+  media?: number;
   encoding?: string;
   fontIndex?: number;
+  /**
+   * Embed the font in the PDF (custom TTF/TTC only).
+   * Defaults: quickDraw `font`/`text.font` and `attachFont` → true;
+   * one-step `loadTTFontFromFile` / `loadTTFontFromFile2` → false.
+   */
+  embedding?: boolean;
 }
 
 export interface Color {
@@ -31,14 +45,23 @@ export interface Text {
   width?: number;
   height?: number;
   unit?: Unit;
+  /** `media` / `filePath` / `name` — see Font fields. */
   font?: Font;
   color?: Color;
   align?: 'left' | 'right' | 'center' | 'justify';
 }
 
 export interface Image {
-  /** Path to the image file. For binary data use loadPngImageFromBuffer/loadRawImageFromBuffer instead. */
-  source: string;
+  /**
+   * Path to the image file. Omit when `media` is set.
+   * For binary data use `loadImageFromBuffer` + `media` (or the one-step sugar APIs).
+   */
+  source?: string;
+  /**
+   * Media handle from `loadImageFromFile` / `loadImageFromBuffer`.
+   * Preferred when the image was pre-loaded / cached and reused across documents.
+   */
+  media?: number;
   x: number;
   y: number;
   width: number;
@@ -46,6 +69,12 @@ export interface Image {
   unit?: Unit;
   /** Force image format. If omitted, detected from file extension. */
   format?: 'png' | 'jpeg';
+  /**
+   * Share the loaded image bytes through the media cache (default false).
+   * Only applies when loading from `source`; ignored when `media` is set.
+   * Prefer leaving this off unless you actually reuse the source.
+   */
+  useCache?: boolean;
 }
 
 export interface Line {

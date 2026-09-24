@@ -37,6 +37,9 @@ namespace margelo::nitro::pdfwriter {
       prototype.registerHybridMethod("setSize", &HybridNitroPdfWriterSpec::setSize);
       prototype.registerHybridMethod("setRotate", &HybridNitroPdfWriterSpec::setRotate);
       prototype.registerHybridMethod("getFont", &HybridNitroPdfWriterSpec::getFont);
+      prototype.registerHybridMethod("loadFontFromFile", &HybridNitroPdfWriterSpec::loadFontFromFile);
+      prototype.registerHybridMethod("loadFontFromBuffer", &HybridNitroPdfWriterSpec::loadFontFromBuffer);
+      prototype.registerHybridMethod("attachFont", &HybridNitroPdfWriterSpec::attachFont);
       prototype.registerHybridMethod("loadType1FontFromFile", &HybridNitroPdfWriterSpec::loadType1FontFromFile);
       prototype.registerHybridMethod("loadTTFontFromFile", &HybridNitroPdfWriterSpec::loadTTFontFromFile);
       prototype.registerHybridMethod("loadTTFontFromFile2", &HybridNitroPdfWriterSpec::loadTTFontFromFile2);
@@ -89,6 +92,10 @@ namespace margelo::nitro::pdfwriter {
       prototype.registerHybridMethod("closePathFillStroke", &HybridNitroPdfWriterSpec::closePathFillStroke);
       prototype.registerHybridMethod("closePathEofillStroke", &HybridNitroPdfWriterSpec::closePathEofillStroke);
       prototype.registerHybridMethod("endPath", &HybridNitroPdfWriterSpec::endPath);
+      prototype.registerHybridMethod("loadImageFromFile", &HybridNitroPdfWriterSpec::loadImageFromFile);
+      prototype.registerHybridMethod("loadImageFromBuffer", &HybridNitroPdfWriterSpec::loadImageFromBuffer);
+      prototype.registerHybridMethod("attachImage", &HybridNitroPdfWriterSpec::attachImage);
+      prototype.registerHybridMethod("freeMedia", &HybridNitroPdfWriterSpec::freeMedia);
       prototype.registerHybridMethod("loadPngImageFromFile", &HybridNitroPdfWriterSpec::loadPngImageFromFile);
       prototype.registerHybridMethod("loadPngImageFromBuffer", &HybridNitroPdfWriterSpec::loadPngImageFromBuffer);
       prototype.registerHybridMethod("loadJpegImageFromFile", &HybridNitroPdfWriterSpec::loadJpegImageFromFile);
@@ -124,6 +131,10 @@ namespace margelo::nitro::pdfwriter {
       prototype.registerHybridMethod("pageTextWidth", &HybridNitroPdfWriterSpec::pageTextWidth);
       prototype.registerHybridMethod("pageTextHeight", &HybridNitroPdfWriterSpec::pageTextHeight);
       prototype.registerHybridMethod("pageMeasureText", &HybridNitroPdfWriterSpec::pageMeasureText);
+      prototype.registerHybridMethod("setCacheDir", &HybridNitroPdfWriterSpec::setCacheDir);
+      prototype.registerHybridMethod("clearMediaCache", &HybridNitroPdfWriterSpec::clearMediaCache);
+      prototype.registerHybridMethod("setMediaCacheLimit", &HybridNitroPdfWriterSpec::setMediaCacheLimit);
+      prototype.registerHybridMethod("getMediaCacheStats", &HybridNitroPdfWriterSpec::getMediaCacheStats);
       prototype.registerHybridMethod("quickDraw", &HybridNitroPdfWriterSpec::quickDraw);
       prototype.registerHybridMethod("quickBatchDraw", &HybridNitroPdfWriterSpec::quickBatchDraw);
       prototype.registerHybridMethod("yuv2rgb", &HybridNitroPdfWriterSpec::yuv2rgb);

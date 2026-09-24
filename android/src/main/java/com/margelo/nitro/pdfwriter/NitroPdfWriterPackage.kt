@@ -14,6 +14,12 @@ class NitroPdfWriterPackage : ReactPackage {
 
   @Suppress("OVERRIDE_DEPRECATION")
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
+    // Auto-wire the platform cache dir so the media cache can persist across restarts.
+    try {
+      NitroPdfWriterCacheDir.set(reactContext.cacheDir.absolutePath + "/nitro-pdf-writer")
+    } catch (_: Throwable) {
+      // Native lib not loaded yet — JS can still call setCacheDir later.
+    }
     return emptyList()
   }
 

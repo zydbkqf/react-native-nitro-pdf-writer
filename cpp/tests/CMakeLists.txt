@@ -36,7 +36,13 @@ add_executable(pdfwriter_tests
   test_main.cpp
   test_handle_registry.cpp
   test_haru_lock.cpp
+  test_media_cache.cpp
+  test_font_prep.cpp
+  test_load_attach.cpp
   test_libharu_smoke.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../MediaCache.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../MediaPrep.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../FontPrep.cpp
   ${LIBHARU_SOURCES}
   ${LIBPNG_SOURCES}
 )
