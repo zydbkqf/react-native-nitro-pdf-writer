@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-pdf-writer",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Fast PDF file writing for React Native using libHaru and Nitro Modules",
   "license": "MIT",
   "homepage": "https://github.com/zydbkqf/react-native-nitro-pdf-writer",
