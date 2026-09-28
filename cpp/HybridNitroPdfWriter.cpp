@@ -14,6 +14,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unistd.h>
 #include <variant>
 #include <vector>
@@ -26,15 +27,12 @@ using namespace margelo::nitro;
 // Helpers
 // ---------------------------------------------------------------------------
 
-static HPDF_Rect toRect(const std::vector<double>& values) {
-  if (values.size() != 4) {
-    throw std::invalid_argument("Rect array must have exactly 4 elements");
-  }
+static HPDF_Rect toRect(const std::tuple<double, double, double, double>& values) {
   HPDF_Rect rect;
-  rect.left = static_cast<HPDF_REAL>(values[0]);
-  rect.top = static_cast<HPDF_REAL>(values[1]);
-  rect.right = static_cast<HPDF_REAL>(values[2]);
-  rect.bottom = static_cast<HPDF_REAL>(values[3]);
+  rect.left = static_cast<HPDF_REAL>(std::get<0>(values));
+  rect.top = static_cast<HPDF_REAL>(std::get<1>(values));
+  rect.right = static_cast<HPDF_REAL>(std::get<2>(values));
+  rect.bottom = static_cast<HPDF_REAL>(std::get<3>(values));
   return rect;
 }
 
@@ -1495,7 +1493,7 @@ std::shared_ptr<Promise<void>> HybridNitroPdfWriter::concat(double page, double 
 // Annotations
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createTextAnnot(double page, const std::vector<double>& rect,
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createTextAnnot(double page, const std::tuple<double, double, double, double>& rect,
                                                                  const std::string& text,
                                                                  const std::optional<std::string>& encoder) {
   auto promise = Promise<double>::create();
@@ -1514,7 +1512,7 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createTextAnnot(double pa
   return promise;
 }
 
-std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createLinkAnnot(double page, const std::vector<double>& rect,
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createLinkAnnot(double page, const std::tuple<double, double, double, double>& rect,
                                                                  double dst) {
   auto promise = Promise<double>::create();
   HaruWorker::getInstance().run<double>(promise, [this, page, rect, dst]() {
@@ -1528,7 +1526,7 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createLinkAnnot(double pa
   return promise;
 }
 
-std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createURILinkAnnot(double page, const std::vector<double>& rect,
+std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createURILinkAnnot(double page, const std::tuple<double, double, double, double>& rect,
                                                                     const std::string& uri) {
   auto promise = Promise<double>::create();
   HaruWorker::getInstance().run<double>(promise, [this, page, rect, uri]() {

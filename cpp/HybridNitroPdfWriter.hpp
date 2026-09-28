@@ -9,6 +9,7 @@
 #include <NitroModules/Promise.hpp>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -192,12 +193,12 @@ public:
                                         double x, double y) override;
 
   // Annotations
-  std::shared_ptr<Promise<double>> createTextAnnot(double page, const std::vector<double>& rect,
+  std::shared_ptr<Promise<double>> createTextAnnot(double page, const std::tuple<double, double, double, double>& rect,
                                                    const std::string& text,
                                                    const std::optional<std::string>& encoder) override;
-  std::shared_ptr<Promise<double>> createLinkAnnot(double page, const std::vector<double>& rect,
+  std::shared_ptr<Promise<double>> createLinkAnnot(double page, const std::tuple<double, double, double, double>& rect,
                                                    double dst) override;
-  std::shared_ptr<Promise<double>> createURILinkAnnot(double page, const std::vector<double>& rect,
+  std::shared_ptr<Promise<double>> createURILinkAnnot(double page, const std::tuple<double, double, double, double>& rect,
                                                       const std::string& uri) override;
 
   // Destinations
