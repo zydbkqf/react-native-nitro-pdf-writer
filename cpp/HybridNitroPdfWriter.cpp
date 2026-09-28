@@ -166,6 +166,9 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createDocument() {
     if (doc == nullptr) {
       throw std::runtime_error("Failed to create HPDF document");
     }
+    if (HPDF_UseUTFEncodings(doc) != HPDF_OK) {
+      throw std::runtime_error("Failed to enable UTF-8 encodings");
+    }
     return _docs.registerPointer(doc, nullptr);
   });
   return promise;
@@ -532,7 +535,9 @@ double HybridNitroPdfWriter::installFontBlob(HPDF_Doc doc, const std::shared_ptr
   }
   throwHaruError(doc);
   if (!fontName) throw std::runtime_error("Failed to load font");
-  HPDF_Font font = HPDF_GetFont(doc, fontName, encoding);
+  // Embedded TrueType fonts default to UTF-8 so CJK / non-ASCII text renders.
+  const char* enc = encoding ? encoding : "UTF-8";
+  HPDF_Font font = HPDF_GetFont(doc, fontName, enc);
   throwHaruError(doc);
   return _fonts.registerPointer(font, doc);
 }
@@ -2542,6 +2547,9 @@ std::shared_ptr<Promise<std::variant<std::string, double>>> HybridNitroPdfWriter
             if (doc == nullptr) {
                 throw std::runtime_error("Failed to create HPDF document");
             }
+            if (HPDF_UseUTFEncodings(doc) != HPDF_OK) {
+                throw std::runtime_error("Failed to enable UTF-8 encodings");
+            }
 
             try {
                 HPDF_Page page = nullptr;
@@ -2625,6 +2633,10 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
                     HPDF_Doc doc = HPDF_New(nullptr, nullptr);
                     if (doc == nullptr) {
                         results.push_back(std::string("Failed to create document"));
+                        continue;
+                    }
+                    if (HPDF_UseUTFEncodings(doc) != HPDF_OK) {
+                        results.push_back(std::string("Failed to enable UTF-8 encodings"));
                         continue;
                     }
 

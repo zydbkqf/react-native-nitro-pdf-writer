@@ -268,7 +268,7 @@ private:
   double installImageBlob(HPDF_Doc doc, const std::shared_ptr<MediaBlob>& blob);
   double installFontBlob(HPDF_Doc doc, const std::shared_ptr<MediaBlob>& blob,
                          std::optional<bool> embedding,
-                         const char* encoding = nullptr);
+                         const char* encoding = "UTF-8");
 
   void executeOperation(HPDF_Doc doc, HPDF_Page& page, const std::shared_ptr<AnyMap>& op,
                        const std::string& defaultUnit, double dpi,
