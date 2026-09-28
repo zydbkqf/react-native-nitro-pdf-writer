@@ -552,6 +552,50 @@ const type1Font = await pdf.loadType1FontFromFile(docHandle, '/path/to/font.afm'
 
 > ⚠️ Font files must be **local file paths**. Remote URLs are **not supported**.
 
+### Font subsetting tool (`subset-font`)
+
+This repo ships a small CLI that shrinks a TTF/WOFF/WOFF2 face down to just the
+glyphs you need, writing a **TrueType (`.ttf`)** subset ready for `loadTTFontFromFile`
+/ `loadFontFromFile`. Smaller fonts → smaller embedded PDFs.
+
+It also runs a **glyf-flavor check**: if the input uses CFF/CFF2 outlines
+(plain `.otf`, or a WOFF/WOFF2 wrapping one) the tool exits with an error,
+because libharu cannot embed those.
+
+```bash
+# npm script (devDependency `subset-font` is used under the hood)
+npm run npw-subset-font -- -i src/NotoSans.ttf --text "你好世界"
+
+# explicit output path
+npm run npw-subset-font -- -i src/font.woff2 -o out/font.ttf --unicodes U+2713,U+4E2D
+
+# characters from a UTF-8 text file, combined with --text
+npm run npw-subset-font -- -i src/font.ttf --text-file chars.txt --text "ABC"
+```
+
+| Option | Description |
+| --- | --- |
+| `-i, --input <path>` | **Required.** Input font (`.ttf` / `.otf` / `.woff` / `.woff2`) |
+| `-o, --output <path>` | Output `.ttf` path. Default: input path with extension replaced by `-output.ttf` (`font.woff2` → `font-output.ttf`) |
+| `--text <string>` | Characters to keep, e.g. `--text "中文✓"` |
+| `--text-file <path>` | UTF-8 text file whose characters should be kept |
+| `--unicodes <list>` | Comma-separated code points (hex): `U+2713,U+4E2D`, `0x2713`, or bare `2713,4E2D` |
+| `-h, --help` | Show usage |
+
+Notes:
+
+- Output is **always** TrueType (`.ttf`), regardless of input container or output extension.
+- The three glyph sources may be combined; the subset keeps the union of their characters.
+- The tool is a build-time helper (it lives in `devDependencies`). Run it in this
+  repo, or vendor the script `subset-font` if you need it in another project.
+
+```bash
+# Example: 15 MB CJK font → a few KB containing only the characters you use
+npm run npw-subset-font -- -i fonts/NotoSansCJKsc-Regular.ttf --text "收款人：你好"
+# [subset-font] fonts/NotoSansCJKsc-Regular.ttf → fonts/NotoSansCJKsc-Regular-output.ttf (ttf, 6 character(s))
+# [subset-font] done: 15253080 → 2804 bytes (100.0% smaller)
+```
+
 ## Images
 
 Only **JPEG** and **PNG** images are natively supported. Other formats (WebP, GIF, BMP, HEIF, etc.) must be decoded to raw pixel data by the caller before passing them to the library via `loadRawImageFromBuffer`.
