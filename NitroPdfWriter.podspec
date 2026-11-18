@@ -40,10 +40,10 @@ Pod::Spec.new do |s|
     'nitrogen/generated/ios/swift/**/*.{swift}',
   ]
 
+  # thirdparty/ only contains the files the build compiles; tests are excluded
+  # because they ship their own main() guarded by a doctest runner.
   s.exclude_files = [
     'cpp/tests',
-    'thirdparty/libpng/pngtest.c',
-    'thirdparty/libpng/example.c',
   ]
 
   s.public_header_files = 'ios/**/*.h'

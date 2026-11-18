@@ -108,6 +108,38 @@ function writePnglibconf() {
   log(`Copied ${path.relative(ROOT, dest)}`);
 }
 
+/**
+ * The npm tarball has a hard size limit and the upstream release tarballs are
+ * mostly tests, contrib examples and autotools scaffolding. Keep only what the
+ * three build systems compile, so re-vendoring never regresses the package size.
+ */
+const LIBPNG_KEEP_ENTRIES = new Set([
+  'png.c', 'pngerror.c', 'pngget.c', 'pngmem.c', 'pngpread.c', 'pngread.c', 'pngrio.c',
+  'pngrtran.c', 'pngrutil.c', 'pngset.c', 'pngtrans.c', 'pngwio.c', 'pngwrite.c',
+  'pngwtran.c', 'pngwutil.c',
+  'png.h', 'pngconf.h', 'pnglibconf.h', 'pngpriv.h', 'pngstruct.h', 'pnginfo.h',
+  'pngdebug.h',
+  'LICENSE', 'LICENSES', 'AUTHORS', 'README',
+]);
+
+const LIBHARU_KEEP_ENTRIES = new Set([
+  'src', 'include', 'LICENSE', 'CHANGES', 'README.md',
+]);
+
+function pruneVendoredTree(name, dir, keepEntries) {
+  let removed = 0;
+  for (const entry of fs.readdirSync(dir)) {
+    if (keepEntries.has(entry)) {
+      continue;
+    }
+    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    removed += 1;
+  }
+  if (removed > 0) {
+    log(`Pruned ${removed} unused ${name} entries (kept ${fs.readdirSync(dir).length})`);
+  }
+}
+
 function assertVendoredVersion(name, requested, actual) {
   if (requested !== actual) {
     throw new Error(
@@ -244,6 +276,7 @@ fetchTree({
   afterExtract: () => {
     const actual = writeLibharuConfig();
     assertVendoredVersion('libharu', LIBHARU_VERSION, actual);
+    pruneVendoredTree('libharu', LIBHARU_DIR, LIBHARU_KEEP_ENTRIES);
   },
 });
 
@@ -256,8 +289,10 @@ fetchTree({
   dest: LIBPNG_DIR,
   marker: path.join(LIBPNG_DIR, 'png.h'),
   afterExtract: () => {
+    // pnglibconf.h is copied out of scripts/, so the prune must run afterwards.
     writePnglibconf();
     assertVendoredVersion('libpng', LIBPNG_VERSION, readLibpngVersion());
+    pruneVendoredTree('libpng', LIBPNG_DIR, LIBPNG_KEEP_ENTRIES);
   },
 });
 

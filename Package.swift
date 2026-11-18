@@ -33,27 +33,11 @@ let package = Package(
         "README.md",
         "LICENSE",
         "NOTICE",
-        "thirdparty/libharu/demo",
-        "thirdparty/libharu/cmake",
-        "thirdparty/libharu/win32",
-        // Only the library sources take part in the SwiftPM build. Everything
-        // else under libpng (contrib has its own main(), pngminim ships another
-        // pnglibconf.h, arm/intel hold assembly) would otherwise be pulled in by
-        // the recursive "thirdparty/libpng" source entry and break the build.
-        "thirdparty/libpng/pngtest.c",
-        "thirdparty/libpng/example.c",
-        "thirdparty/libpng/contrib",
-        "thirdparty/libpng/pngminim",
-        "thirdparty/libpng/arm",
-        "thirdparty/libpng/intel",
-        "thirdparty/libpng/mips",
-        "thirdparty/libpng/powerpc",
-        "thirdparty/libpng/riscv",
-        "thirdparty/libpng/loongarch",
-        "thirdparty/libpng/projects",
-        "thirdparty/libpng/scripts",
-        "thirdparty/libpng/tests",
-        "thirdparty/libpng/ci",
+        // thirdparty/ is vendored down to the files the build actually compiles
+        // (see thirdparty/README.md), so nothing here needs a directory exclude
+        // beyond the docs that must not become SwiftPM sources.
+        "thirdparty/libpng/README",
+        "thirdparty/libharu/README.md",
       ],
       sources: [
         "cpp",
