@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -26,6 +27,21 @@ using namespace margelo::nitro;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * libharu hands out raw HPDF_Doc pointers. Own them from creation time so an
+ * early failure (UTF encoding setup, first page, a bad operation) still runs
+ * HPDF_Free instead of leaking the whole document.
+ */
+using HpdfDocOwner = std::unique_ptr<std::remove_pointer_t<HPDF_Doc>, decltype(&HPDF_Free)>;
+
+static HpdfDocOwner makeOwnedDoc(const char* failureMessage) {
+  HPDF_Doc raw = HPDF_New(nullptr, nullptr);
+  if (raw == nullptr) {
+    throw std::runtime_error(failureMessage);
+  }
+  return HpdfDocOwner(raw, &HPDF_Free);
+}
 
 static HPDF_Rect toRect(const std::tuple<double, double, double, double>& values) {
   HPDF_Rect rect;
@@ -160,14 +176,12 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::createDocument() {
   auto promise = Promise<double>::create();
   HaruWorker::getInstance().run<double>(promise, [this]() {
     std::lock_guard<std::mutex> lock(HaruLock::get());
-    HPDF_Doc doc = HPDF_New(nullptr, nullptr);
-    if (doc == nullptr) {
-      throw std::runtime_error("Failed to create HPDF document");
-    }
-    if (HPDF_UseUTFEncodings(doc) != HPDF_OK) {
+    HpdfDocOwner doc = makeOwnedDoc("Failed to create HPDF document");
+    if (HPDF_UseUTFEncodings(doc.get()) != HPDF_OK) {
       throw std::runtime_error("Failed to enable UTF-8 encodings");
     }
-    return _docs.registerPointer(doc, nullptr);
+    // Ownership moves into the handle registry from here on.
+    return _docs.registerPointer(doc.release(), nullptr);
   });
   return promise;
 }
@@ -1242,13 +1256,49 @@ static MediaBlob::Kind detectImageKind(const std::string& path) {
   return (ext == ".jpg" || ext == ".jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
 }
 
+/**
+ * Containers that cannot live inside a PDF (HEIC/WebP/AVIF) are decoded by the
+ * platform layer. The hint below only matters when magic-byte sniffing cannot
+ * decide (corrupt or header-less payloads); the bytes always win.
+ */
+static MediaPrep::ImageContainer parseImageContainerHint(const std::string& format) {
+  std::string lower = format;
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+  if (lower == "heic" || lower == "heif") {
+    return MediaPrep::ImageContainer::Heic;
+  }
+  if (lower == "webp") {
+    return MediaPrep::ImageContainer::Webp;
+  }
+  if (lower == "avif") {
+    return MediaPrep::ImageContainer::Avif;
+  }
+  return MediaPrep::ImageContainer::Unknown;
+}
+
+static MediaPrep::ImageContainer detectImageContainerHint(const std::string& path) {
+  std::string ext = std::filesystem::path(path).extension().string();
+  std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+  if (ext == ".heic" || ext == ".heif") {
+    return MediaPrep::ImageContainer::Heic;
+  }
+  if (ext == ".webp") {
+    return MediaPrep::ImageContainer::Webp;
+  }
+  if (ext == ".avif") {
+    return MediaPrep::ImageContainer::Avif;
+  }
+  return MediaPrep::ImageContainer::Unknown;
+}
+
 std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadImageFromFile(const std::string& fileName,
                                                                          std::optional<bool> useCache) {
   auto promise = Promise<double>::create();
   bool cache = useCache.value_or(false);
   MediaWorker::getInstance().run<double>(promise, [this, fileName, cache]() {
     MediaBlob::Kind kind = detectImageKind(fileName);
-    auto blob = MediaPrep::prepareImageFile(fileName, kind, cache);
+    auto blob = MediaPrep::prepareImageFile(fileName, kind, cache,
+                                           detectImageContainerHint(fileName));
     return _media.registerBlob(blob);
   });
   return promise;
@@ -1260,10 +1310,22 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadImageFromBuffer(
   auto promise = Promise<double>::create();
   bool cache = useCache.value_or(false);
   MediaBlob::Kind kind = parseImageFormat(format);
-  MediaWorker::getInstance().run<double>(promise, [this, buffer, kind, width, height, colorSpace, cache]() {
-    auto blob = MediaPrep::prepareImageBuffer(
-        buffer->data(), buffer->size(), kind, static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height), static_cast<int>(colorSpace), cache);
+  MediaPrep::ImageContainer declared = parseImageContainerHint(format);
+  MediaWorker::getInstance().run<double>(promise, [this, buffer, kind, width, height, colorSpace, cache,
+                                                   declared]() {
+    // Validate before narrowing: `static_cast<uint32_t>(1e30)` is undefined
+    // behaviour. Geometry only matters for raw pixels; encoded formats take
+    // their dimensions from the header.
+    uint32_t pixelWidth = 0;
+    uint32_t pixelHeight = 0;
+    int cs = 0;
+    if (kind == MediaBlob::Kind::Raw) {
+      pixelWidth = MediaPrep::checkedDimension(width, "width");
+      pixelHeight = MediaPrep::checkedDimension(height, "height");
+      cs = MediaPrep::checkedColorSpace(colorSpace);
+    }
+    auto blob = MediaPrep::prepareImageBuffer(buffer->data(), buffer->size(), kind, pixelWidth,
+                                              pixelHeight, cs, cache, declared);
     return _media.registerBlob(blob);
   });
   return promise;
@@ -1332,10 +1394,18 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromFile(doub
                                                                       double colorSpace) {
   auto promise = Promise<double>::create();
   MediaWorker::getInstance().run<double>(promise, [this, doc, fileName, width, height, colorSpace]() {
+    uint32_t pixelWidth = MediaPrep::checkedDimension(width, "width");
+    uint32_t pixelHeight = MediaPrep::checkedDimension(height, "height");
+    int cs = MediaPrep::checkedColorSpace(colorSpace);
     auto blob = MediaPrep::prepareImageFile(fileName, MediaBlob::Kind::Raw, /*useCache=*/false);
-    blob->width = static_cast<uint32_t>(width);
-    blob->height = static_cast<uint32_t>(height);
-    blob->colorSpace = static_cast<int>(colorSpace);
+    size_t expected =
+        MediaPrep::checkedPixelBytes(pixelWidth, pixelHeight, MediaPrep::colorSpaceComponents(cs));
+    if (blob->bytes.size() < expected) {
+      throw std::invalid_argument("Raw image file is smaller than width * height * components");
+    }
+    blob->width = pixelWidth;
+    blob->height = pixelHeight;
+    blob->colorSpace = cs;
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
     return installImageBlob(h.get(), blob);
@@ -1351,26 +1421,19 @@ std::shared_ptr<Promise<double>> HybridNitroPdfWriter::loadRawImageFromBuffer(do
   auto promise = Promise<double>::create();
   bool cache = useCache.value_or(false);
   MediaWorker::getInstance().run<double>(promise, [this, doc, buffer, width, height, colorSpace, cache]() {
-    if (width <= 0 || height <= 0) {
-      throw std::invalid_argument("Width and height must be positive");
-    }
-    size_t components = 3;
-    HPDF_ColorSpace cs = static_cast<HPDF_ColorSpace>(colorSpace);
-    if (cs == HPDF_CS_DEVICE_GRAY) {
-      components = 1;
-    } else if (cs == HPDF_CS_DEVICE_RGB) {
-      components = 3;
-    } else if (cs == HPDF_CS_DEVICE_CMYK) {
-      components = 4;
-    }
-    size_t expected = static_cast<size_t>(width) * static_cast<size_t>(height) * components;
+    uint32_t pixelWidth = MediaPrep::checkedDimension(width, "width");
+    uint32_t pixelHeight = MediaPrep::checkedDimension(height, "height");
+    int cs = MediaPrep::checkedColorSpace(colorSpace);
+    size_t expected =
+        MediaPrep::checkedPixelBytes(pixelWidth, pixelHeight, MediaPrep::colorSpaceComponents(cs));
     if (buffer->size() < expected) {
-      throw std::invalid_argument("Buffer too small for raw image data");
+      throw std::invalid_argument(
+          "Buffer too small for raw image data: expected " + std::to_string(expected) +
+          " bytes, got " + std::to_string(buffer->size()));
     }
-    auto blob = MediaPrep::prepareImageBuffer(buffer->data(), buffer->size(), MediaBlob::Kind::Raw,
-                                              static_cast<uint32_t>(width),
-                                              static_cast<uint32_t>(height),
-                                              static_cast<int>(colorSpace), cache);
+    auto blob = MediaPrep::prepareImageBuffer(buffer->data(), buffer->size(),
+                                              MediaBlob::Kind::Raw, pixelWidth, pixelHeight, cs,
+                                              cache);
     std::lock_guard<std::mutex> lock(HaruLock::get());
     Handle<HPDF_Doc> h(doc, _docs);
     return installImageBlob(h.get(), blob);
@@ -2138,7 +2201,11 @@ void HybridNitroPdfWriter::executeOperation(
                 if (it != media->images.end()) blob = it->second;
             }
             if (!blob) {
-                blob = MediaPrep::prepareImageFile(source, kind, useCache);
+                MediaPrep::ImageContainer hint = parseImageContainerHint(format);
+                if (hint == MediaPrep::ImageContainer::Unknown) {
+                    hint = detectImageContainerHint(source);
+                }
+                blob = MediaPrep::prepareImageFile(source, kind, useCache, hint);
             }
         }
 
@@ -2511,7 +2578,11 @@ static void preparseQuickDrawOps(const std::vector<std::shared_ptr<AnyMap>>& ope
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         kind = (ext == ".jpg" || ext == ".jpeg") ? MediaBlob::Kind::Jpeg : MediaBlob::Kind::Png;
       }
-      media.images[source] = MediaPrep::prepareImageFile(source, kind, useCache);
+      MediaPrep::ImageContainer hint = parseImageContainerHint(format);
+      if (hint == MediaPrep::ImageContainer::Unknown) {
+        hint = detectImageContainerHint(source);
+      }
+      media.images[source] = MediaPrep::prepareImageFile(source, kind, useCache, hint);
     } else if (type == "font" && op->contains("data")) {
       prepFontData(op->getObject("data"));
     } else if (type == "text" && op->contains("data")) {
@@ -2540,43 +2611,35 @@ std::shared_ptr<Promise<std::variant<std::string, double>>> HybridNitroPdfWriter
 
             std::lock_guard<std::mutex> lock(HaruLock::get());
 
-            // Create document
-            HPDF_Doc doc = HPDF_New(nullptr, nullptr);
-            if (doc == nullptr) {
-                throw std::runtime_error("Failed to create HPDF document");
-            }
+            // Create document. The owner frees it on every path, including
+            // an early throw from UTF encoding setup.
+            HpdfDocOwner docOwner = makeOwnedDoc("Failed to create HPDF document");
+            HPDF_Doc doc = docOwner.get();
             if (HPDF_UseUTFEncodings(doc) != HPDF_OK) {
                 throw std::runtime_error("Failed to enable UTF-8 encodings");
             }
 
-            try {
-                HPDF_Page page = nullptr;
+            HPDF_Page page = nullptr;
 
-                for (const auto& op : operations) {
-                    // If no page exists yet and this isn't a page operation, create a default one
-                    if (page == nullptr && !(op->contains("type") && op->getString("type") == "page")) {
-                        page = HPDF_AddPage(doc);
-                        throwHaruError(doc);
-                    }
-                    // executeOperation takes page by reference; "page" ops create a new page internally
-                    executeOperation(doc, page, op, unit, dpiVal, &media);
-                }
-
-                if (outputPath.has_value()) {
-                    // Save to file
-                    HPDF_SaveToFile(doc, outputPath->c_str());
+            for (const auto& op : operations) {
+                // If no page exists yet and this isn't a page operation, create a default one
+                if (page == nullptr && !(op->contains("type") && op->getString("type") == "page")) {
+                    page = HPDF_AddPage(doc);
                     throwHaruError(doc);
-                    HPDF_Free(doc);
-                    return std::variant<std::string, double>(outputPath.value());
-                } else {
-                    // Return doc handle
-                    double handle = _docs.registerPointer(doc, nullptr);
-                    return std::variant<std::string, double>(handle);
                 }
-            } catch (...) {
-                HPDF_Free(doc);
-                throw;
+                // executeOperation takes page by reference; "page" ops create a new page internally
+                executeOperation(doc, page, op, unit, dpiVal, &media);
             }
+
+            if (outputPath.has_value()) {
+                // Save to file; docOwner frees the document when the lambda returns.
+                HPDF_SaveToFile(doc, outputPath->c_str());
+                throwHaruError(doc);
+                return std::variant<std::string, double>(outputPath.value());
+            }
+            // Return doc handle — ownership transfers to the registry.
+            double handle = _docs.registerPointer(docOwner.release(), nullptr);
+            return std::variant<std::string, double>(handle);
         });
 
     return promise;
@@ -2627,12 +2690,16 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
 
                     std::lock_guard<std::mutex> lock(HaruLock::get());
 
-                    // Create document
-                    HPDF_Doc doc = HPDF_New(nullptr, nullptr);
-                    if (doc == nullptr) {
-                        results.push_back(std::string("Failed to create document"));
+                    // Create document. docOwner releases it on both the
+                    // failure and the success path of this item.
+                    HpdfDocOwner docOwner(nullptr, &HPDF_Free);
+                    try {
+                        docOwner = makeOwnedDoc("Failed to create document");
+                    } catch (const std::exception& e) {
+                        results.push_back(std::string(e.what()));
                         continue;
                     }
+                    HPDF_Doc doc = docOwner.get();
                     if (HPDF_UseUTFEncodings(doc) != HPDF_OK) {
                         results.push_back(std::string("Failed to enable UTF-8 encodings"));
                         continue;
@@ -2652,14 +2719,12 @@ std::shared_ptr<Promise<std::vector<std::variant<std::string, double>>>> HybridN
                         if (outputPath.has_value()) {
                             HPDF_SaveToFile(doc, outputPath->c_str());
                             throwHaruError(doc);
-                            HPDF_Free(doc);
                             results.push_back(outputPath.value());
                         } else {
-                            double handle = _docs.registerPointer(doc, nullptr);
+                            double handle = _docs.registerPointer(docOwner.release(), nullptr);
                             results.push_back(handle);
                         }
                     } catch (const std::exception& e) {
-                        HPDF_Free(doc);
                         results.push_back(std::string(e.what()));
                     }
                 } catch (const std::exception& e) {
@@ -2685,14 +2750,30 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv
     auto promise = Promise<std::shared_ptr<ArrayBuffer>>::create();
     HaruWorker::getInstance().run<std::shared_ptr<ArrayBuffer>>(promise,
         [buffer, width, height, format]() {
-            int w = static_cast<int>(width);
-            int h = static_cast<int>(height);
-
-            if (w <= 0 || h <= 0) {
-                throw std::invalid_argument("Width and height must be positive");
+            const bool isNv = format == YuvFormat::NV12 || format == YuvFormat::NV21;
+            const bool isPlanar = format == YuvFormat::I420 || format == YuvFormat::YUV420P;
+            if (!isNv && !isPlanar) {
+                throw std::invalid_argument("Unsupported YUV format");
             }
 
-            size_t rgbSize = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
+            // Camera-sized frames only: 8192^2 RGB is already ~200 MB.
+            constexpr uint32_t kMaxYuvDimension = 8192;
+            uint32_t w = MediaPrep::checkedDimension(width, "width");
+            uint32_t h = MediaPrep::checkedDimension(height, "height");
+            if (w > kMaxYuvDimension || h > kMaxYuvDimension) {
+                throw std::invalid_argument("YUV dimensions must not exceed " +
+                                            std::to_string(kMaxYuvDimension));
+            }
+
+            // NV12/NV21 subsample chroma 2x2 with a tightly packed UV plane whose
+            // stride equals width. That layout is only defined for even edges.
+            if (isNv && ((w & 1u) != 0 || (h & 1u) != 0)) {
+                throw std::invalid_argument(
+                    "NV12/NV21 require even width and height; the tightly packed UV plane "
+                    "has stride == width and no padding for odd edges");
+            }
+
+            size_t rgbSize = MediaPrep::checkedPixelBytes(w, h, 3);
             std::shared_ptr<ArrayBuffer> rgbBuffer = ArrayBuffer::allocate(rgbSize);
             uint8_t* rgb = rgbBuffer->data();
             const uint8_t* yuv = buffer->data();
@@ -2700,102 +2781,72 @@ std::shared_ptr<Promise<std::shared_ptr<ArrayBuffer>>> HybridNitroPdfWriter::yuv
             auto clamp = [](int v) -> uint8_t {
                 return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
             };
+            auto toRgb = [&clamp](int yv, int u, int v) {
+                struct Rgb { uint8_t r, g, b; };
+                int r = yv + ((359 * v) >> 8);
+                int g = yv - ((88 * u + 183 * v) >> 8);
+                int b = yv + ((454 * u) >> 8);
+                return Rgb{clamp(r), clamp(g), clamp(b)};
+            };
 
-            if (format == YuvFormat::NV12) {
-                // NV12: Y plane followed by interleaved UV plane
-                // UV plane: width w (aligned to 2), height (h+1)/2
-                size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
-                size_t uvStride = static_cast<size_t>(w);  // interleaved UV pairs, width aligned to 2
-                size_t uvHeight = (static_cast<size_t>(h) + 1) / 2;
-                size_t uvPlaneSize = uvStride * uvHeight;
-                if (buffer->size() < ySize + uvPlaneSize) {
-                    throw std::invalid_argument("Buffer too small for NV12 format");
-                }
+            size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
+            if (buffer->size() < ySize) {
+                throw std::invalid_argument("Buffer too small for the Y plane");
+            }
+            const uint8_t* yPlane = yuv;
 
-                const uint8_t* yPlane = yuv;
-                const uint8_t* uvPlane = yuv + ySize;
-
-                for (int j = 0; j < h; j++) {
-                    for (int i = 0; i < w; i++) {
-                        int y = yPlane[j * w + i];
-                        size_t uvIndex = (static_cast<size_t>(j / 2) * uvStride) + static_cast<size_t>(i & ~1);
-                        int u = uvPlane[uvIndex] - 128;
-                        int v = uvPlane[uvIndex + 1] - 128;
-
-                        int r = y + ((359 * v) >> 8);
-                        int g = y - ((88 * u + 183 * v) >> 8);
-                        int b = y + ((454 * u) >> 8);
-
-                        size_t idx = (static_cast<size_t>(j) * w + i) * 3;
-                        rgb[idx] = clamp(r);
-                        rgb[idx + 1] = clamp(g);
-                        rgb[idx + 2] = clamp(b);
-                    }
-                }
-            } else if (format == YuvFormat::NV21) {
-                // NV21: Y plane followed by interleaved VU plane
-                size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
+            if (isNv) {
+                // NV12: interleaved U,V. NV21: interleaved V,U.
                 size_t uvStride = static_cast<size_t>(w);
-                size_t uvHeight = (static_cast<size_t>(h) + 1) / 2;
+                size_t uvHeight = static_cast<size_t>(h) / 2;
                 size_t uvPlaneSize = uvStride * uvHeight;
                 if (buffer->size() < ySize + uvPlaneSize) {
-                    throw std::invalid_argument("Buffer too small for NV21 format");
+                    throw std::invalid_argument(format == YuvFormat::NV12
+                                                    ? "Buffer too small for NV12 format"
+                                                    : "Buffer too small for NV21 format");
                 }
-
-                const uint8_t* yPlane = yuv;
-                const uint8_t* vuPlane = yuv + ySize;
-
-                for (int j = 0; j < h; j++) {
-                    for (int i = 0; i < w; i++) {
-                        int y = yPlane[j * w + i];
-                        size_t uvIndex = (static_cast<size_t>(j / 2) * uvStride) + static_cast<size_t>(i & ~1);
-                        int v = vuPlane[uvIndex] - 128;
-                        int u = vuPlane[uvIndex + 1] - 128;
-
-                        int r = y + ((359 * v) >> 8);
-                        int g = y - ((88 * u + 183 * v) >> 8);
-                        int b = y + ((454 * u) >> 8);
-
+                const uint8_t* chromaPlane = yuv + ySize;
+                for (uint32_t j = 0; j < h; ++j) {
+                    for (uint32_t i = 0; i < w; ++i) {
+                        int yv = yPlane[static_cast<size_t>(j) * w + i];
+                        size_t uvIndex =
+                            static_cast<size_t>(j / 2) * uvStride + static_cast<size_t>(i & ~1u);
+                        int first = chromaPlane[uvIndex] - 128;
+                        int second = chromaPlane[uvIndex + 1] - 128;
+                        int u = format == YuvFormat::NV12 ? first : second;
+                        int v = format == YuvFormat::NV12 ? second : first;
+                        auto px = toRgb(yv, u, v);
                         size_t idx = (static_cast<size_t>(j) * w + i) * 3;
-                        rgb[idx] = clamp(r);
-                        rgb[idx + 1] = clamp(g);
-                        rgb[idx + 2] = clamp(b);
+                        rgb[idx] = px.r;
+                        rgb[idx + 1] = px.g;
+                        rgb[idx + 2] = px.b;
                     }
                 }
-            } else if (format == YuvFormat::I420 || format == YuvFormat::YUV420P) {
-                // I420: Y plane, then U plane, then V plane
-                // Chroma dimensions: ceil(w/2) x ceil(h/2)
-                size_t ySize = static_cast<size_t>(w) * static_cast<size_t>(h);
+            } else {
+                // I420 / YUV420P: Y plane, then U plane, then V plane.
+                // Chroma is ceil(w/2) x ceil(h/2), so odd edges are allowed.
                 size_t uvWidth = (static_cast<size_t>(w) + 1) / 2;
                 size_t uvHeight = (static_cast<size_t>(h) + 1) / 2;
                 size_t uvSize = uvWidth * uvHeight;
                 if (buffer->size() < ySize + uvSize * 2) {
                     throw std::invalid_argument("Buffer too small for I420 format");
                 }
-
-                const uint8_t* yPlane = yuv;
                 const uint8_t* uPlane = yuv + ySize;
-                const uint8_t* vPlane = yuv + ySize + uvSize;
-
-                for (int j = 0; j < h; j++) {
-                    for (int i = 0; i < w; i++) {
-                        int y = yPlane[j * w + i];
-                        size_t chromaIdx = (static_cast<size_t>(j / 2) * uvWidth) + static_cast<size_t>(i / 2);
+                const uint8_t* vPlane = uPlane + uvSize;
+                for (uint32_t j = 0; j < h; ++j) {
+                    for (uint32_t i = 0; i < w; ++i) {
+                        int yv = yPlane[static_cast<size_t>(j) * w + i];
+                        size_t chromaIdx =
+                            static_cast<size_t>(j / 2) * uvWidth + static_cast<size_t>(i / 2);
                         int u = uPlane[chromaIdx] - 128;
                         int v = vPlane[chromaIdx] - 128;
-
-                        int r = y + ((359 * v) >> 8);
-                        int g = y - ((88 * u + 183 * v) >> 8);
-                        int b = y + ((454 * u) >> 8);
-
+                        auto px = toRgb(yv, u, v);
                         size_t idx = (static_cast<size_t>(j) * w + i) * 3;
-                        rgb[idx] = clamp(r);
-                        rgb[idx + 1] = clamp(g);
-                        rgb[idx + 2] = clamp(b);
+                        rgb[idx] = px.r;
+                        rgb[idx + 1] = px.g;
+                        rgb[idx + 2] = px.b;
                     }
                 }
-            } else {
-                throw std::invalid_argument("Unsupported YUV format");
             }
 
             return rgbBuffer;
@@ -2840,6 +2891,8 @@ std::shared_ptr<Promise<std::shared_ptr<AnyMap>>> HybridNitroPdfWriter::getMedia
     map->setDouble("entries", static_cast<double>(cache.entryCount()));
     map->setDouble("totalBytes", static_cast<double>(cache.totalBytes()));
     map->setDouble("maxBytes", static_cast<double>(cache.maxBytes()));
+    map->setDouble("diskBytes", static_cast<double>(cache.diskBytes()));
+    map->setDouble("maxDiskBytes", static_cast<double>(cache.maxDiskBytes()));
     return map;
   });
   return promise;

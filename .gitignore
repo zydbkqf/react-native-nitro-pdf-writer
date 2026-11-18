@@ -68,9 +68,7 @@ yarn-error.log
 /coverage
 *.tsbuildinfo
 
-# libharu and libpng are downloaded by scripts/prepare-libharu.js
-/libharu
-/libpng
+# Native dependencies (libharu, libpng) are vendored in thirdparty/ and tracked.
 
 # C++ test build artifacts
 cpp/tests/build

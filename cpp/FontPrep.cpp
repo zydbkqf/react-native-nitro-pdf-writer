@@ -159,6 +159,80 @@ void parseGlyphMetrics(MediaBlob& blob, uint32_t faceOffset) {
   }
 }
 
+namespace {
+
+/** Parse TTC index + glyph metrics for the face recorded on the blob. */
+void parseFace(MediaBlob& blob) {
+  parseTtcIndex(blob);
+  if (blob.faceIndex >= blob.ttcFaceOffsets.size()) {
+    throw std::invalid_argument("Font face index out of range");
+  }
+  parseGlyphMetrics(blob, blob.ttcFaceOffsets[blob.faceIndex]);
+}
+
+/**
+ * HPDF_LoadTTFont* requires a path, so an in-memory font is written to a
+ * per-blob temp file that lives exactly as long as the blob.
+ */
+void materializeBuffer(MediaBlob& blob, uint64_t hash) {
+  namespace fs = std::filesystem;
+  std::string dir = MediaCache::instance().cacheDir();
+  if (dir.empty()) {
+    dir = fs::temp_directory_path().string();
+  }
+  // font-src/ is NOT under the wipeable npdf-media-cache payload dir —
+  // MediaCache::clear() must not delete files still owned by live blobs.
+  fs::path outDir = fs::path(dir) / "npdf-font-src";
+  std::error_code ec;
+  fs::create_directories(outDir, ec);
+  static std::atomic<uint64_t> s_seq{0};
+  uint64_t seq = ++s_seq;
+  char name[80];
+  std::snprintf(name, sizeof(name), "f_%016llx_%u_%llu.ttf",
+                static_cast<unsigned long long>(hash), blob.faceIndex,
+                static_cast<unsigned long long>(seq));
+  fs::path outPath = outDir / name;
+  {
+    std::ofstream out(outPath, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("Failed to materialize font buffer");
+    }
+    out.write(reinterpret_cast<const char*>(blob.bytes.data()),
+              static_cast<std::streamsize>(blob.bytes.size()));
+  }
+  blob.fontPath = outPath.string();
+  // Reuse the file as long as the blob lives; delete with the blob.
+  blob.ownedTempPath = blob.fontPath;
+}
+
+/**
+ * The disk cache only persists bytes plus geometry. Rebuild everything attach
+ * needs: glyph metrics, TTC face map, and a usable load path.
+ *
+ * Takes blob->restoreMu itself; versions are keyed by mtime/size/content hash,
+ * so re-parsing from the cached bytes always matches what the source had.
+ * Throws on a corrupt payload — the caller discards the cache entry.
+ */
+void rebuildFromDisk(MediaBlob& blob, const std::string* sourcePath, uint64_t hash) {
+  std::lock_guard<std::mutex> lock(blob.restoreMu);
+  if (!blob.restoredFromDisk) {
+    return;
+  }
+  if (blob.ttcFaceOffsets.empty() || blob.numGlyphs == 0 || blob.advanceWidths.empty()) {
+    parseFace(blob);
+  }
+  if (blob.fontPath.empty()) {
+    if (sourcePath != nullptr) {
+      blob.fontPath = *sourcePath;
+    } else {
+      materializeBuffer(blob, hash);
+    }
+  }
+  blob.restoredFromDisk = false;
+}
+
+} // namespace
+
 std::shared_ptr<MediaBlob> parseFromBytes(std::vector<uint8_t> bytes, uint32_t faceIndex,
                                           int64_t versionMtime, uint64_t sourceSize) {
   auto blob = std::make_shared<MediaBlob>();
@@ -191,7 +265,15 @@ std::shared_ptr<MediaBlob> loadFromFile(const std::string& path, uint32_t faceIn
 
   auto& cache = MediaCache::instance();
   if (auto hit = cache.get(key)) {
-    return hit;
+    // A corrupt disk entry must be dropped, not kept: otherwise every later
+    // load of this font throws the same parse error forever.
+    try {
+      rebuildFromDisk(*hit, &path, 0);
+      return hit;
+    } catch (...) {
+      // Corrupt payload: drop the entry and re-parse the file below.
+      cache.discardEntry(key, hit.get());
+    }
   }
 
   std::ifstream in(path, std::ios::binary | std::ios::ate);
@@ -223,7 +305,12 @@ std::shared_ptr<MediaBlob> loadFromBuffer(const uint8_t* data, size_t size, uint
   auto& cache = MediaCache::instance();
   if (useCache) {
     if (auto hit = cache.get(key)) {
-      return hit;
+      try {
+        rebuildFromDisk(*hit, nullptr, hash);
+        return hit;
+      } catch (...) {
+        cache.discardEntry(key, hit.get());
+      }
     }
   }
 
@@ -232,34 +319,7 @@ std::shared_ptr<MediaBlob> loadFromBuffer(const uint8_t* data, size_t size, uint
 
   // HPDF_LoadTTFont* requires a path — materialize one file per blob instance.
   // Unique names avoid two blobs sharing (and deleting) the same path.
-  namespace fs = std::filesystem;
-  std::string dir = cache.cacheDir();
-  if (dir.empty()) {
-    dir = fs::temp_directory_path().string();
-  }
-  // font-src/ is NOT under the wipeable npdf-media-cache payload dir —
-  // MediaCache::clear() must not delete files still owned by live blobs.
-  fs::path outDir = fs::path(dir) / "npdf-font-src";
-  std::error_code ec;
-  fs::create_directories(outDir, ec);
-  static std::atomic<uint64_t> s_seq{0};
-  uint64_t seq = ++s_seq;
-  char name[80];
-  std::snprintf(name, sizeof(name), "f_%016llx_%u_%llu.ttf",
-                static_cast<unsigned long long>(hash), faceIndex,
-                static_cast<unsigned long long>(seq));
-  fs::path outPath = outDir / name;
-  {
-    std::ofstream out(outPath, std::ios::binary | std::ios::trunc);
-    if (!out) {
-      throw std::runtime_error("Failed to materialize font buffer");
-    }
-    out.write(reinterpret_cast<const char*>(blob->bytes.data()),
-              static_cast<std::streamsize>(blob->bytes.size()));
-  }
-  blob->fontPath = outPath.string();
-  // Reuse the file as long as the blob lives; delete with the blob.
-  blob->ownedTempPath = blob->fontPath;
+  materializeBuffer(*blob, hash);
 
   if (useCache) {
     cache.put(key, blob);

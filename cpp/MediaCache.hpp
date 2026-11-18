@@ -48,6 +48,16 @@ struct MediaBlob {
   uint32_t height = 0;
   int colorSpace = 0;
 
+  /**
+   * Set when the blob came back from the disk cache. Only the payload bytes and
+   * the fields persisted in the disk envelope are populated: derived state
+   * (font metrics, materialized font path, validated image headers) still has
+   * to be rebuilt by the owning loader before the blob can be attached.
+   */
+  bool restoredFromDisk = false;
+  /** Guards lazy reconstruction so concurrent cache hits rebuild once. */
+  std::mutex restoreMu;
+
   ~MediaBlob() {
     if (!ownedTempPath.empty()) {
       std::remove(ownedTempPath.c_str());
@@ -90,6 +100,14 @@ public:
   size_t entryCount() const;
 
   /**
+   * Disk cache is an independent layer: it survives process restarts and is
+   * bounded by its own byte budget, pruned separately from the in-memory LRU.
+   */
+  void setMaxDiskBytes(size_t maxBytes);
+  size_t maxDiskBytes() const;
+  size_t diskBytes() const;
+
+  /**
    * Returns a pinned blob (refCount++) or nullptr on miss.
    * The returned shared_ptr unpins automatically when destroyed.
    */
@@ -103,6 +121,16 @@ public:
 
   /** Drops every unpinned entry and deletes disk cache files. */
   void clear();
+
+  /** Drops unpinned in-memory entries but leaves the disk layer intact. */
+  void clearMemory();
+
+  /**
+   * Drops one entry from memory and disk. `expected` guards against a racing
+   * put() replacing the entry with a fresh blob under the same key — only the
+   * poisoned instance is removed.
+   */
+  void discardEntry(const std::string& key, const MediaBlob* expected = nullptr);
 
   /** Sets the byte cap and evicts immediately. */
   void trimTo(size_t maxBytes);
@@ -126,11 +154,17 @@ private:
   };
 
   void unpin(const std::string& key);
+  void clearMemoryLocked();
   void evictLocked(const std::string* keepKey = nullptr);
   bool loadFromDiskLocked(const std::string& key, std::shared_ptr<MediaBlob>& out);
   void writeToDiskLocked(const std::string& key, const MediaBlob& blob);
+  void discardDiskEntryLocked(const std::string& key);
   void clearDiskLocked();
+  void scanDiskUsageLocked();
+  void pruneDiskLocked(const std::string* keepKey = nullptr);
   std::string diskPathFor(const std::string& key) const;
+
+  static constexpr size_t kDefaultMaxDiskBytes = 128ull * 1024ull * 1024ull;
 
   mutable std::shared_mutex _mutex;
   std::unordered_map<std::string, Entry> _map;
@@ -138,6 +172,12 @@ private:
   size_t _maxBytes = 32ull * 1024ull * 1024ull; // 32 MiB default
   uint64_t _lruClock = 0;
   std::string _cacheDir;
+
+  // Disk layer accounting. Lazily measured on the first write / stat call.
+  size_t _maxDiskBytes = kDefaultMaxDiskBytes;
+  size_t _diskBytes = 0;
+  bool _diskBytesKnown = false;
+  size_t _diskWritesSincePrune = 0;
 };
 
 /**

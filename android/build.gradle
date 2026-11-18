@@ -17,7 +17,12 @@ android {
   compileSdk safeExtGet("compileSdkVersion", 34)
 
   defaultConfig {
-    minSdk safeExtGet("minSdkVersion", 21)
+    minSdk safeExtGet("minSdkVersion", 24)
+    // HEIC/WebP transcode tests run on a device/emulator (androidTest).
+    testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    // The JNI bridge resolves these Kotlin classes by name; without consumer
+    // rules a release build with R8 strips them and transcoding silently stops.
+    consumerProguardFiles "consumer-rules.pro"
     externalNativeBuild {
       cmake {
         arguments "-DANDROID_STL=c++_shared"
@@ -45,11 +50,31 @@ android {
       path file("CMakeLists.txt")
     }
   }
+
+  packagingOptions {
+    // CMake also drops the prefab-provided shared libs next to our JNI libs,
+    // and react-android ships its own copies; the androidTest APK merges both
+    // and reports a duplicate. Keep whichever comes first.
+    pickFirst "**/libc++_shared.so"
+    pickFirst "**/libfbjni.so"
+    pickFirst "**/libjsi.so"
+    pickFirst "**/libreactnative.so"
+    pickFirst "**/libNitroModules.so"
+  }
 }
 
 dependencies {
   implementation "com.facebook.react:react-native:+"
   implementation project(':react-native-nitro-modules')
+
+  // Pure JVM tests for ImageTranscodePolicy (API gating, subsampling, sizing).
+  testImplementation "junit:junit:4.13.2"
+
+  // On-device tests for the actual HEIC/WebP decoding.
+  androidTestImplementation "junit:junit:4.13.2"
+  androidTestImplementation "androidx.test:runner:1.6.2"
+  androidTestImplementation "androidx.test:core:1.6.1"
+  androidTestImplementation "androidx.test.ext:junit:1.2.1"
 }
 
 apply from: "../nitrogen/generated/android/NitroPdfWriter+autolinking.gradle"

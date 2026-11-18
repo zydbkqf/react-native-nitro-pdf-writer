@@ -5,25 +5,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # -----------------------------------------------------------------------------
-# Prepare libharu before building. This matches the behavior of the iOS podspec
-# and ensures the C sources are available.
+# Native dependencies are vendored under thirdparty/ and compiled from source.
+# Nothing is downloaded at build time.
 # -----------------------------------------------------------------------------
 set(MODULE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
-set(LIBHARU_DIR ${MODULE_ROOT}/libharu)
-set(LIBPNG_DIR ${MODULE_ROOT}/libpng)
+set(LIBHARU_DIR ${MODULE_ROOT}/thirdparty/libharu)
+set(LIBPNG_DIR ${MODULE_ROOT}/thirdparty/libpng)
 
-if(NOT EXISTS ${LIBHARU_DIR}/include/hpdf.h OR NOT EXISTS ${LIBPNG_DIR}/png.h)
-  execute_process(
-    COMMAND node ${MODULE_ROOT}/scripts/prepare-libharu.js
-    WORKING_DIRECTORY ${MODULE_ROOT}
-    RESULT_VARIABLE PREPARE_RESULT
-  )
-  if(NOT PREPARE_RESULT EQUAL 0)
-    message(FATAL_ERROR "Failed to prepare native dependencies. Run 'node scripts/prepare-libharu.js' manually.")
-  endif()
+if(NOT EXISTS ${LIBHARU_DIR}/include/hpdf.h
+   OR NOT EXISTS ${LIBHARU_DIR}/include/hpdf_config.h
+   OR NOT EXISTS ${LIBPNG_DIR}/png.h
+   OR NOT EXISTS ${LIBPNG_DIR}/pnglibconf.h)
+  message(FATAL_ERROR "Vendored sources missing under thirdparty/. The package is incomplete; reinstall it instead of patching the working copy.")
 endif()
 
-# Build libpng as a static library for Android. iOS uses the system libpng.
+# libpng is compiled from the vendored sources on every platform: Android here,
+# iOS in the podspec and SwiftPM targets. No platform uses a system libpng.
 add_library(png STATIC
   ${LIBPNG_DIR}/png.c
   ${LIBPNG_DIR}/pngerror.c
@@ -54,7 +51,9 @@ add_library(
   ../cpp/MediaWorker.cpp
   ../cpp/MediaCache.cpp
   ../cpp/MediaPrep.cpp
+  ../cpp/PlatformImageTranscoder.cpp
   ../cpp/FontPrep.cpp
+  AndroidImageTranscoder.cpp
   ../cpp/HybridNitroPdfWriter.cpp
   ../nitrogen/generated/shared/c++/HybridNitroPdfWriterSpec.cpp
   cpp-adapter.cpp

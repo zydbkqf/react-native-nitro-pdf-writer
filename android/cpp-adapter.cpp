@@ -3,7 +3,12 @@
 #include "NitroPdfWriterOnLoad.hpp"
 #include "MediaCache.hpp"
 
+// Defined in AndroidImageTranscoder.cpp: lets the platform image decoder
+// attach worker threads to the JVM.
+extern "C" void NitroPdfWriterAndroidSetJavaVM(JavaVM* vm);
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+  NitroPdfWriterAndroidSetJavaVM(vm);
   return facebook::jni::initialize(vm, []() {
     margelo::nitro::pdfwriter::registerAllNatives();
   });

@@ -171,14 +171,25 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   // ---------------------------------------------------------------------------
   /**
    * Two-step image API — load: read file → buffer + parse headers outside the
-   * global lock. Auto-detects PNG/JPEG from the extension. Returns a media handle.
-   * @param useCache Share the payload via MediaCache across documents (default false).
+   * global lock. Container is sniffed from magic bytes (extension is only a hint),
+   * so `.png`/`.jpg`/`.jpeg`/`.heic`/`.heif`/`.webp`/`.avif` all work.
+   * Returns a media handle.
+   *
+   * HEIC/WebP/AVIF cannot be embedded in PDF, so they are decoded by the platform
+   * (ImageIO on iOS; ImageDecoder/BitmapFactory on Android), downscaled to
+   * max 4096 px on the long edge, orientation-corrected, and re-encoded to JPEG
+   * (opaque) or PNG (with alpha). The transcoded payload is what gets cached.
+   * Android 7/8 (API 24-27) has no HEIF decoder and rejects HEIC with an error
+   * naming the required API level; AVIF additionally requires Android 12 (API 31+).
+   * @param useCache Share the (possibly transcoded) payload via MediaCache across documents (default false).
    */
   loadImageFromFile(fileName: string, useCache?: boolean): Promise<number>;
   /**
    * Two-step image API — load from an in-memory buffer.
-   * @param format 'png' | 'jpeg' | 'raw'
-   * @param width/height/colorSpace Required for 'raw'; ignored for png/jpeg.
+   * @param format 'png' | 'jpeg' | 'raw' | 'heic' | 'heif' | 'webp' | 'avif'.
+   *   Only a hint: the container is decided by magic bytes, so `'png'` with HEIC
+   *   bytes is still transcoded correctly. Use 'raw' for raw pixel data.
+   * @param width/height/colorSpace Required for 'raw'; ignored for encoded formats.
    */
   loadImageFromBuffer(
     buffer: ArrayBuffer,
@@ -329,7 +340,7 @@ export interface NitroPdfWriter extends HybridObject<{ ios: 'c++'; android: 'c++
   clearMediaCache(): Promise<void>;
   /** Set the cache byte cap (LRU eviction). Default is 32 MiB. */
   setMediaCacheLimit(maxBytes: number): Promise<void>;
-  /** Snapshot: { entries, totalBytes, maxBytes }. */
+  /** Snapshot: { entries, totalBytes, maxBytes, diskBytes, maxDiskBytes }. */
   getMediaCacheStats(): Promise<AnyMap>;
 
   // ---------------------------------------------------------------------------

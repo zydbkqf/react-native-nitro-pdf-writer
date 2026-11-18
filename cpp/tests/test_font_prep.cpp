@@ -2,6 +2,8 @@
 #include <doctest/doctest.h>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <unistd.h>
 
 using namespace margelo::nitro::pdfwriter;
 
@@ -212,4 +214,101 @@ TEST_CASE("FontPrep loadFromBuffer files survive MediaCache::clear") {
   REQUIRE(std::filesystem::exists(path));
   MediaCache::instance().clear();
   CHECK(std::filesystem::exists(path));
+}
+
+// ---------------------------------------------------------------------------
+// Disk cache restore: bytes only, everything else must be rebuilt
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::filesystem::path uniqueFontCacheDir() {
+  static int counter = 0;
+  auto dir = std::filesystem::temp_directory_path() /
+             ("npdf-font-test-" + std::to_string(::getpid()) + "-" +
+              std::to_string(++counter));
+  std::filesystem::create_directories(dir);
+  return dir;
+}
+
+std::filesystem::path writeSyntheticFont(const std::filesystem::path& dir) {
+  auto bytes = makeSyntheticTtf();
+  auto path = dir / "synthetic.ttf";
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+  out.close();
+  return path;
+}
+
+} // namespace
+
+TEST_CASE("FontPrep cold disk hit rebuilds metrics and the load path") {
+  auto& cache = MediaCache::instance();
+  cache.setCacheDir("");
+  cache.clear();
+  cache.setMaxBytes(1024 * 1024);
+
+  auto dir = uniqueFontCacheDir();
+  cache.setCacheDir(dir.string());
+  auto fontPath = writeSyntheticFont(dir);
+
+  {
+    auto first = FontPrep::loadFromFile(fontPath.string(), 0);
+    REQUIRE(first != nullptr);
+    CHECK(first->fontPath == fontPath.string());
+    CHECK(first->unitsPerEm == 1024);
+  }
+
+  // Simulate a process restart: the in-memory layer is gone, only bytes remain.
+  cache.clearMemory();
+  CHECK(cache.entryCount() == 0);
+
+  auto restored = FontPrep::loadFromFile(fontPath.string(), 0);
+  REQUIRE(restored != nullptr);
+  CHECK(!restored->restoredFromDisk);
+  // installFontBlob requires a path; metrics are needed by callers as well.
+  CHECK(restored->fontPath == fontPath.string());
+  CHECK(restored->unitsPerEm == 1024);
+  CHECK(restored->numGlyphs == 3);
+  CHECK(restored->advanceWidths.size() == 2);
+  CHECK(restored->postScriptName == "TestPS");
+  CHECK(!restored->ttcFaceOffsets.empty());
+
+  restored.reset();
+  cache.clear();
+  cache.setCacheDir("");
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("FontPrep buffer cold disk hit re-materializes a usable font file") {
+  auto& cache = MediaCache::instance();
+  cache.setCacheDir("");
+  cache.clear();
+  cache.setMaxBytes(1024 * 1024);
+
+  auto dir = uniqueFontCacheDir();
+  cache.setCacheDir(dir.string());
+
+  auto bytes = makeSyntheticTtf();
+  {
+    auto first = FontPrep::loadFromBuffer(bytes.data(), bytes.size(), 0, /*useCache=*/true);
+    REQUIRE(first != nullptr);
+  }
+
+  cache.clearMemory();
+
+  auto restored = FontPrep::loadFromBuffer(bytes.data(), bytes.size(), 0, /*useCache=*/true);
+  REQUIRE(restored != nullptr);
+  CHECK(!restored->restoredFromDisk);
+  CHECK(!restored->fontPath.empty());
+  CHECK(std::filesystem::exists(restored->fontPath));
+  CHECK(restored->ownedTempPath == restored->fontPath);
+  CHECK(restored->unitsPerEm == 1024);
+  CHECK(restored->advanceWidths.size() == 2);
+
+  restored.reset();
+  cache.clear();
+  cache.setCacheDir("");
+  std::filesystem::remove_all(dir);
 }

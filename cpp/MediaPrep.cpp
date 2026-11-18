@@ -1,8 +1,13 @@
 #include "MediaPrep.hpp"
 
+#include "hpdf_types.h"
+
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace margelo::nitro::pdfwriter {
@@ -10,6 +15,46 @@ namespace margelo::nitro::pdfwriter {
 namespace MediaPrep {
 
 namespace fs = std::filesystem;
+
+namespace {
+
+/** HEIC/WebP/AVIF: not embeddable in PDF, must go through the platform decoder. */
+bool isTranscodable(ImageContainer container) {
+  return container == ImageContainer::Heic || container == ImageContainer::Webp ||
+         container == ImageContainer::Avif;
+}
+
+/** Read just enough bytes to sniff a container (no full read on cache hits). */
+std::vector<uint8_t> readFileHeader(const std::string& path, size_t maxBytes) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("Cannot open file: " + path);
+  }
+  std::vector<uint8_t> head(maxBytes);
+  in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(maxBytes));
+  head.resize(static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0)));
+  return head;
+}
+
+/** PNG/JPEG magic wins over the caller's extension- or format-based guess. */
+MediaBlob::Kind kindForContainer(ImageContainer container, MediaBlob::Kind fallback) {
+  switch (container) {
+    case ImageContainer::Png:
+      return MediaBlob::Kind::Png;
+    case ImageContainer::Jpeg:
+      return MediaBlob::Kind::Jpeg;
+    default:
+      return fallback;
+  }
+}
+
+const char* kindTag(MediaBlob::Kind kind) {
+  return kind == MediaBlob::Kind::Png   ? "png"
+         : kind == MediaBlob::Kind::Jpeg ? "jpeg"
+                                         : "raw";
+}
+
+} // namespace
 
 FileStamp statFile(const std::string& path) {
   std::error_code ec;
@@ -98,26 +143,57 @@ void parseImageMeta(MediaBlob& blob) {
 }
 
 std::shared_ptr<MediaBlob> prepareImageFile(const std::string& path, MediaBlob::Kind kind,
-                                            bool useCache) {
+                                            bool useCache, ImageContainer declared) {
   FileStamp stamp = statFile(path);
-  const char* kindTag = kind == MediaBlob::Kind::Png   ? "png"
-                        : kind == MediaBlob::Kind::Jpeg ? "jpeg"
-                                                        : "raw";
-  std::string key = MediaCache::fileKey(kindTag, path, stamp.mtime, stamp.size);
+
+  // Raw payloads are pixel data, not a container: never sniff those.
+  const bool encoded = kind != MediaBlob::Kind::Raw;
+  ImageContainer container = ImageContainer::Unknown;
+  if (encoded) {
+    const std::vector<uint8_t> header = readFileHeader(path, 32);
+    container = sniffImageContainer(header.data(), header.size());
+    if (container == ImageContainer::Unknown) {
+      container = declared;
+    }
+  }
+  const bool needsTranscode = encoded && isTranscodable(container);
+  const TranscodeOptions options{};
+
+  std::string key =
+      needsTranscode
+          ? MediaCache::fileKey(transcodeKeyTag(container, options), path, stamp.mtime, stamp.size)
+          : MediaCache::fileKey(kindTag(kindForContainer(container, kind)), path, stamp.mtime,
+                                stamp.size);
 
   auto& cache = MediaCache::instance();
   if (useCache) {
     if (auto hit = cache.get(key)) {
-      return hit;
+      try {
+        restoreImageFromDisk(*hit);
+        return hit;
+      } catch (...) {
+        // Corrupt disk entry: drop memory + disk so the key cannot keep
+        // re-throwing, then rebuild from the caller's source bytes below.
+        cache.discardEntry(key, hit.get());
+      }
     }
   }
 
   auto blob = std::make_shared<MediaBlob>();
-  blob->kind = kind;
-  blob->bytes = readFile(path);
   blob->versionMtime = stamp.mtime;
   blob->sourceSize = stamp.size;
-  if (kind == MediaBlob::Kind::Png || kind == MediaBlob::Kind::Jpeg) {
+  blob->bytes = readFile(path);
+
+  if (needsTranscode) {
+    // Cache the transcoded payload: a cold start must not re-decode the photo.
+    auto transcoded =
+        transcodeToPdfImage(blob->bytes.data(), blob->bytes.size(), container, options);
+    blob->kind = transcoded.kind;
+    blob->bytes = std::move(transcoded.bytes);
+  } else {
+    blob->kind = kindForContainer(container, kind);
+  }
+  if (blob->kind != MediaBlob::Kind::Raw) {
     parseImageMeta(*blob);
   }
 
@@ -130,29 +206,74 @@ std::shared_ptr<MediaBlob> prepareImageFile(const std::string& path, MediaBlob::
 
 std::shared_ptr<MediaBlob> prepareImageBuffer(const uint8_t* data, size_t size,
                                               MediaBlob::Kind kind, uint32_t width,
-                                              uint32_t height, int colorSpace, bool useCache) {
+                                              uint32_t height, int colorSpace, bool useCache,
+                                              ImageContainer declared) {
+  const bool encoded = kind != MediaBlob::Kind::Raw;
+  ImageContainer container = ImageContainer::Unknown;
+  if (encoded) {
+    container = sniffImageContainer(data, size);
+    if (container == ImageContainer::Unknown) {
+      container = declared;
+    }
+  } else {
+    // Raw pixels are copied verbatim into the PDF by HPDF_LoadRawImageFromMem,
+    // which reads width * height * components bytes without looking at the
+    // buffer length. Reject a short buffer here instead of over-reading later.
+    const size_t expected = checkedPixelBytes(width, height, colorSpaceComponents(colorSpace));
+    if (size < expected) {
+      throw std::invalid_argument(
+          "Raw image buffer is smaller than width * height * components");
+    }
+  }
+  const bool needsTranscode = encoded && isTranscodable(container);
+  const TranscodeOptions options{};
+
   uint64_t hash = MediaCache::hashBytes(data, size);
-  std::string key = MediaCache::bufferKey(
-      kind == MediaBlob::Kind::Png ? "png" : kind == MediaBlob::Kind::Jpeg ? "jpeg" : "raw", hash,
-      width, height, colorSpace);
+  std::string key;
+  if (needsTranscode) {
+    // Geometry fields are meaningless here; the content hash already pins the source.
+    key = MediaCache::bufferKey(transcodeKeyTag(container, options), hash, 0, 0, 0);
+  } else {
+    MediaBlob::Kind keyKind = kindForContainer(container, kind);
+    // Encoded payloads derive their geometry from the header, so the ignored
+    // width/height/colorSpace arguments must not leak into the key.
+    key = MediaCache::bufferKey(kindTag(keyKind), hash, encoded ? 0 : width, encoded ? 0 : height,
+                                encoded ? 0 : colorSpace);
+  }
 
   auto& cache = MediaCache::instance();
   if (useCache) {
     if (auto hit = cache.get(key)) {
-      return hit;
+      // A corrupt disk entry must not stay cached: drop it so the next call
+      // re-derives the blob from the source bytes instead of throwing forever.
+      try {
+        restoreImageFromDisk(*hit);
+        return hit;
+      } catch (...) {
+        // Corrupt disk entry: drop memory + disk so the key cannot keep
+        // re-throwing, then rebuild from the caller's source bytes below.
+        cache.discardEntry(key, hit.get());
+      }
     }
   }
 
   auto blob = std::make_shared<MediaBlob>();
-  blob->kind = kind;
-  blob->bytes.assign(data, data + size);
   blob->versionMtime = 0;
   blob->sourceSize = size;
+
+  if (needsTranscode) {
+    auto transcoded = transcodeToPdfImage(data, size, container, options);
+    blob->kind = transcoded.kind;
+    blob->bytes = std::move(transcoded.bytes);
+  } else {
+    blob->kind = kindForContainer(container, kind);
+    blob->bytes.assign(data, data + size);
+  }
   blob->width = width;
   blob->height = height;
   blob->colorSpace = colorSpace;
-  if (kind == MediaBlob::Kind::Png || kind == MediaBlob::Kind::Jpeg) {
-    parseImageMeta(*blob);
+  if (blob->kind != MediaBlob::Kind::Raw) {
+    parseImageMeta(*blob); // encoded payload: dimensions come from the header
   }
 
   if (useCache) {
@@ -160,6 +281,78 @@ std::shared_ptr<MediaBlob> prepareImageBuffer(const uint8_t* data, size_t size,
     return cache.get(key); // pinned
   }
   return blob;
+}
+
+uint32_t checkedDimension(double value, const char* what) {
+  if (!std::isfinite(value)) {
+    throw std::invalid_argument(std::string(what) + " must be a finite number");
+  }
+  if (value != std::trunc(value)) {
+    throw std::invalid_argument(std::string(what) + " must be an integer");
+  }
+  if (value <= 0 || value > static_cast<double>(kMaxImageDimension)) {
+    throw std::invalid_argument(std::string(what) + " must be between 1 and " +
+                                std::to_string(kMaxImageDimension));
+  }
+  return static_cast<uint32_t>(value);
+}
+
+int checkedColorSpace(double value) {
+  if (!std::isfinite(value) || value != std::trunc(value)) {
+    throw std::invalid_argument("colorSpace must be an integer");
+  }
+  // Compare in double space: narrowing a value like 1e30 to int is undefined
+  // behaviour, so the range check has to happen before the cast.
+  if (value != static_cast<double>(HPDF_CS_DEVICE_GRAY) &&
+      value != static_cast<double>(HPDF_CS_DEVICE_RGB) &&
+      value != static_cast<double>(HPDF_CS_DEVICE_CMYK)) {
+    throw std::invalid_argument(
+        "colorSpace must be DEVICE_GRAY, DEVICE_RGB or DEVICE_CMYK");
+  }
+  return static_cast<int>(value);
+}
+
+size_t colorSpaceComponents(int colorSpace) {
+  switch (colorSpace) {
+    case HPDF_CS_DEVICE_GRAY:
+      return 1;
+    case HPDF_CS_DEVICE_RGB:
+      return 3;
+    case HPDF_CS_DEVICE_CMYK:
+      return 4;
+    default:
+      throw std::invalid_argument("Unsupported raw image color space");
+  }
+}
+
+size_t checkedPixelBytes(uint32_t width, uint32_t height, size_t components) {
+  if (width == 0 || height == 0 || components == 0) {
+    throw std::invalid_argument("Image dimensions and components must be non-zero");
+  }
+  size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+  if (pixels / static_cast<size_t>(width) != static_cast<size_t>(height)) {
+    throw std::invalid_argument("Image dimensions overflow");
+  }
+  if (pixels > std::numeric_limits<size_t>::max() / components) {
+    throw std::invalid_argument("Image byte count overflows size_t");
+  }
+  return pixels * components;
+}
+
+void restoreImageFromDisk(MediaBlob& blob) {
+  // Always take the lock: the previous unlocked fast-path read raced with the
+  // writer holding the mutex.
+  std::lock_guard<std::mutex> lock(blob.restoreMu);
+  if (!blob.restoredFromDisk) {
+    return;
+  }
+  if (blob.kind == MediaBlob::Kind::Png || blob.kind == MediaBlob::Kind::Jpeg) {
+    // Re-derive dimensions from the encoded bytes. A truncated cache file makes
+    // this throw; the loader then discards the entry (memory + disk) so the key
+    // re-derives from the real source on the next call.
+    parseImageMeta(blob);
+  }
+  blob.restoredFromDisk = false;
 }
 
 } // namespace MediaPrep

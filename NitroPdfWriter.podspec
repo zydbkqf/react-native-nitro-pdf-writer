@@ -15,18 +15,26 @@ Pod::Spec.new do |s|
 
   s.static_framework = true
 
-  # Ensure libharu and libpng are downloaded before CocoaPods evaluates the source files.
-  s.prepare_command = 'node scripts/prepare-libharu.js'
+  # libharu and libpng are vendored under thirdparty/ and compiled from source
+  # for every platform — no download step runs during `pod install`.
 
   s.libraries = 'z'
+  # ImageIO decodes HEIC/WebP/AVIF before the bytes reach libharu (PDF cannot
+  # embed those containers); CoreGraphics normalizes them to sRGB. CoreImage is
+  # only used to bake EXIF orientation when ImageIO refuses the thumbnail path.
+  s.frameworks = 'ImageIO', 'CoreGraphics', 'CoreImage'
+
+  # The transcoder registers itself from `+load`; without -ObjC the linker drops
+  # that object file out of the static framework and HEIC/WebP stop working.
+  s.user_target_xcconfig = { 'OTHER_LDFLAGS' => '$(inherited) -ObjC' }
 
   s.source_files = [
     'ios/**/*.{h,m,mm,swift}',
     'cpp/**/*.{h,hpp,c,cc,cpp}',
-    'libharu/src/**/*.{c,h}',
-    'libharu/include/**/*.{h}',
-    'libpng/png*.c',
-    'libpng/png*.h',
+    'thirdparty/libharu/src/**/*.{c,h}',
+    'thirdparty/libharu/include/**/*.{h}',
+    'thirdparty/libpng/png*.c',
+    'thirdparty/libpng/png*.h',
     'nitrogen/generated/shared/c++/**/*.{h,hpp}',
     'nitrogen/generated/ios/c++/**/*.{h,hpp}',
     'nitrogen/generated/ios/swift/**/*.{swift}',
@@ -34,8 +42,8 @@ Pod::Spec.new do |s|
 
   s.exclude_files = [
     'cpp/tests',
-    'libpng/pngtest.c',
-    'libpng/example.c',
+    'thirdparty/libpng/pngtest.c',
+    'thirdparty/libpng/example.c',
   ]
 
   s.public_header_files = 'ios/**/*.h'
@@ -43,12 +51,12 @@ Pod::Spec.new do |s|
   s.pod_target_xcconfig = {
     'HEADER_SEARCH_PATHS' => [
       '"$(PODS_TARGET_SRCROOT)/cpp"',
-      '"$(PODS_TARGET_SRCROOT)/libharu/include"',
-      '"$(PODS_TARGET_SRCROOT)/libpng"',
+      '"$(PODS_TARGET_SRCROOT)/thirdparty/libharu/include"',
+      '"$(PODS_TARGET_SRCROOT)/thirdparty/libpng"',
       '"$(PODS_TARGET_SRCROOT)/nitrogen/generated/shared/c++"',
       '"$(PODS_TARGET_SRCROOT)/nitrogen/generated/ios/c++"',
     ].join(' '),
-    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
+    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++20',
     'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) HPDF_NOPACKPROTOCOL=1 PNG_ARM_NEON_OPT=0',
   }
 

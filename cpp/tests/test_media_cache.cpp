@@ -1,6 +1,9 @@
 #include "MediaCache.hpp"
 #include <doctest/doctest.h>
+#include <filesystem>
+#include <fstream>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace margelo::nitro::pdfwriter;
@@ -86,6 +89,7 @@ TEST_CASE("MediaCache unpinned entries become evictable after release") {
   // After release, "pinned" is unpinned but still resident (under cap).
   CHECK(cache.get("pinned") != nullptr);
   cache.trimTo(100); // force eviction of unpinned entries
+  CHECK(cache.entryCount() == 0); // 164-byte entry no longer fits in 100 bytes
   cache.trimTo(200);
 }
 
@@ -161,4 +165,183 @@ TEST_CASE("MediaCache is safe under concurrent access") {
     th.join();
   }
   CHECK(cache.totalBytes() <= 64 * 1024);
+}
+
+// ---------------------------------------------------------------------------
+// Disk layer: metadata restore + independent capacity
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::filesystem::path uniqueCacheDir() {
+  static int counter = 0;
+  auto dir = std::filesystem::temp_directory_path() /
+             ("npdf-cache-test-" + std::to_string(::getpid()) + "-" +
+              std::to_string(++counter));
+  std::filesystem::create_directories(dir);
+  return dir;
+}
+
+size_t diskPayloadBytes(const std::filesystem::path& dir) {
+  size_t total = 0;
+  auto cacheDir = dir / "npdf-media-cache";
+  if (!std::filesystem::exists(cacheDir)) {
+    return 0;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(cacheDir)) {
+    if (entry.is_regular_file()) {
+      total += static_cast<size_t>(std::filesystem::file_size(entry.path()));
+    }
+  }
+  return total;
+}
+
+} // namespace
+
+TEST_CASE("MediaCache disk restore keeps kind and raw geometry") {
+  auto& cache = MediaCache::instance();
+  cache.setCacheDir("");
+  cache.clear();
+  cache.setMaxBytes(1024 * 1024);
+
+  auto dir = uniqueCacheDir();
+  cache.setCacheDir(dir.string());
+
+  auto blob = makeBlob(64, MediaBlob::Kind::Raw);
+  blob->width = 40;
+  blob->height = 30;
+  blob->colorSpace = 9;
+  std::string key = MediaCache::bufferKey("raw", 0x1234, 40, 30, 9);
+  cache.put(key, blob);
+  blob.reset();
+
+  // Drop the in-memory copy so the next get() has to read the disk envelope.
+  cache.clearMemory();
+  CHECK(cache.entryCount() == 0);
+
+  auto hit = cache.get(key);
+  REQUIRE(hit != nullptr);
+  CHECK(hit->kind == MediaBlob::Kind::Raw);
+  CHECK(hit->width == 40);
+  CHECK(hit->height == 30);
+  CHECK(hit->colorSpace == 9);
+  CHECK(hit->bytes.size() == 64);
+  CHECK(hit->restoredFromDisk);
+
+  hit.reset();
+  cache.clear();
+  cache.setCacheDir("");
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("MediaCache disk restore never returns a half-built font blob") {
+  auto& cache = MediaCache::instance();
+  cache.setCacheDir("");
+  cache.clear();
+  cache.setMaxBytes(1024 * 1024);
+
+  auto dir = uniqueCacheDir();
+  cache.setCacheDir(dir.string());
+
+  auto blob = makeBlob(32, MediaBlob::Kind::Font);
+  blob->faceIndex = 2;
+  blob->isTtc = true;
+  blob->unitsPerEm = 1000;
+  blob->numGlyphs = 500;
+  blob->advanceWidths = {10, 20, 30};
+  blob->fontPath = "/fonts/original.ttc";
+  std::string key = MediaCache::fileKey("font", "/fonts/original.ttc#2", 111, 333);
+  cache.put(key, blob);
+  blob.reset();
+
+  cache.clearMemory();
+  auto hit = cache.get(key);
+  REQUIRE(hit != nullptr);
+  // Bytes + face index survive; derived state must be flagged for rebuild
+  // rather than silently presented as a ready-to-attach font.
+  CHECK(hit->kind == MediaBlob::Kind::Font);
+  CHECK(hit->faceIndex == 2);
+  CHECK(hit->restoredFromDisk);
+  CHECK(hit->fontPath.empty());
+  CHECK(hit->advanceWidths.empty());
+  CHECK(hit->numGlyphs == 0);
+
+  hit.reset();
+  cache.clear();
+  cache.setCacheDir("");
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("MediaCache disk layer honors its own byte budget") {
+  auto& cache = MediaCache::instance();
+  cache.setCacheDir("");
+  cache.clear();
+  cache.setMaxBytes(8 * 1024 * 1024);
+
+  auto dir = uniqueCacheDir();
+  cache.setCacheDir(dir.string());
+  cache.setMaxDiskBytes(4096);
+
+  for (int i = 0; i < 16; ++i) {
+    cache.put("disk:" + std::to_string(i), makeBlob(1024));
+  }
+
+  CHECK(cache.diskBytes() <= 4096);
+  CHECK(diskPayloadBytes(dir) <= 4096);
+  // The entry survives because prune receives it as keepKey, not because mtime
+  // orders it last (1s granularity can tie it with older files).
+  cache.clearMemory();
+  CHECK(cache.get("disk:15") != nullptr);
+
+  cache.clear();
+  cache.setMaxDiskBytes(128ull * 1024ull * 1024ull);
+  cache.setCacheDir("");
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("diskBytes counts sidecars and prune removes orphan keys") {
+  auto& cache = MediaCache::instance();
+  cache.setCacheDir("");
+  cache.clear();
+  cache.setMaxBytes(1024 * 1024);
+
+  auto dir = uniqueCacheDir();
+  cache.setCacheDir(dir.string());
+  cache.setMaxDiskBytes(1024 * 1024);
+
+  cache.put("disk-sidecar", makeBlob(200));
+
+  // An interrupted write can leave a .key whose .bin never landed. Such a
+  // sidecar is unloadable and would otherwise sit in the budget forever.
+  const auto payloadDir = dir / "npdf-media-cache";
+  const auto orphan = payloadDir / "orphan-deadbeef.key";
+  { std::ofstream out(orphan, std::ios::binary); out << "orphan"; }
+
+  // diskBytes() has to include .key, otherwise the reported budget drifts low.
+  // The orphan above was written behind the cache's back, so it only enters the
+  // accounting once a scan/prune walks the directory.
+  const size_t orphanBytes = static_cast<size_t>(std::filesystem::file_size(orphan));
+  CHECK(cache.diskBytes() == diskPayloadBytes(dir) - orphanBytes);
+
+  // Force a prune by shrinking the budget, then writing again.
+  cache.setMaxDiskBytes(200);
+  cache.put("disk-sidecar-2", makeBlob(200));
+
+  CHECK(!std::filesystem::exists(orphan));
+  CHECK(cache.diskBytes() == diskPayloadBytes(dir));
+  size_t tmpFiles = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(payloadDir)) {
+    const std::string name = entry.path().filename().string();
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+      ++tmpFiles;
+    }
+  }
+  CHECK(tmpFiles == 0);
+  // The payload written by the triggering put survives the prune.
+  CHECK(cache.get("disk-sidecar-2") != nullptr);
+
+  cache.clear();
+  cache.setMaxDiskBytes(128ull * 1024ull * 1024ull);
+  cache.setCacheDir("");
+  std::filesystem::remove_all(dir);
 }

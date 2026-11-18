@@ -9,6 +9,8 @@ class NitroPdfWriterPackage : ReactPackage {
   companion object {
     init {
       NitroPdfWriterOnLoad.initializeNative()
+      // Install the HEIC/WebP platform decoder hook before any PDF work starts.
+      NitroPdfWriterImageTranscoder.setup()
     }
   }
 

@@ -41,13 +41,22 @@ yarn add react-native-nitro-pdf-writer react-native-nitro-modules
 cd ios && pod install && cd ..
 ```
 
-The podspec automatically downloads libharu during `pod install`.
+libharu and libpng are vendored under `thirdparty/` and compiled from source, so `pod install` never downloads anything.
 
 ### Android
 
-No manual steps are required. Gradle runs `scripts/prepare-libharu.js` during the build to download libharu.
+No manual steps are required. Gradle compiles the vendored libharu/libpng sources from `thirdparty/`; nothing is downloaded at build time.
 
 If you use ProGuard/R8, no extra rules are needed — the library is pure C++ with Nitro bindings.
+
+### Native dependencies
+
+`thirdparty/libharu` and `thirdparty/libpng` hold the upstream sources, committed to this
+repository and compiled from source on iOS (CocoaPods), Android (CMake) and SwiftPM. Neither
+install nor build ever fetches them.
+
+To bump either library, run `yarn vendor:update` (optionally with `LIBHARU_VERSION` /
+`LIBPNG_VERSION`), then review and commit the diff under `thirdparty/`.
 
 ## Usage
 
@@ -275,7 +284,8 @@ Provide **one** of the following:
 
 ### `image`
 
-Draw a PNG or JPEG image from a file path **or** a pre-loaded media handle.
+Draw a PNG, JPEG, HEIC/HEIF or WebP image from a file path **or** a pre-loaded media handle
+(HEIC/WebP are transcoded to JPEG/PNG by the platform decoder before they reach libharu).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -598,7 +608,59 @@ npm run npw-subset-font -- -i fonts/NotoSansCJKsc-Regular.ttf --text "收款人�
 
 ## Images
 
-Only **JPEG** and **PNG** images are natively supported. Other formats (WebP, GIF, BMP, HEIF, etc.) must be decoded to raw pixel data by the caller before passing them to the library via `loadRawImageFromBuffer`.
+PDF image XObjects only understand **JPEG**, **PNG**, JPEG 2000 and raw/CCITT pixel data,
+so HEIC/WebP cannot be embedded as-is. This library bridges that gap for the formats
+mobile apps actually hand you:
+
+| Source container | iOS 15.1+ | Android |
+|---|---|---|
+| PNG, JPEG, raw pixels | ✅ native | ✅ native |
+| WebP (lossy/lossless/alpha, first frame) | ✅ ImageIO | ✅ BitmapFactory (all API levels) |
+| HEIC/HEIF | ✅ ImageIO | ✅ API 28+ (`ImageDecoder`) |
+| AVIF | ✅ ImageIO (iOS 16+) | ✅ API 31+ (`ImageDecoder`) |
+
+Anything not listed is rejected with a readable error: on Android 7/8 (API 24–27)
+a HEIC load fails with *"HEIC/HEIF decoding requires Android 9 (API 28) or newer;
+this device runs API 24..."* instead of silently producing a broken page.
+
+How the transcode behaves:
+
+- The container is decided by **magic bytes**, not the file extension or `format`
+  argument — a `.png` that is really HEIC is still handled correctly.
+- Decoding runs on the platform stack (`ImageIO` / `ImageDecoder`), so HEVC patent
+  licensing and decoder hardening stay with the OS: no extra binary size.
+- **EXIF orientation is baked into the pixels.** PDF images carry no orientation, so a
+  portrait phone photo would otherwise land sideways.
+- Long edge is capped at **4096 px** (≈ A4 at 480 dpi); a 48 MP photo never allocates a
+  giant buffer or bloats the PDF.
+- Output is **JPEG (q≈85)** for opaque sources and **PNG** when the source genuinely
+  uses alpha (the PNG becomes an image + SMask). Fully-opaque HEIC/WebP still go out as
+  JPEG — alpha is detected by inspecting pixels, not by trusting the container metadata.
+- The **transcoded** payload is what `MediaCache` stores, so a cold start re-reads the
+  cached JPEG/PNG instead of decoding the photo again.
+
+Two Android decoder limits worth knowing (both verified on a HyperOS / API 36 device):
+
+- **HEIF alpha is dropped by the platform.** `ImageDecoder` and `BitmapFactory` both
+  report `hasAlpha() == false` for a HEIC whose transparency lives in the auxiliary
+  image, so a transparent HEIC comes out as opaque JPEG on Android. iOS (ImageIO)
+  keeps the alpha and produces PNG + SMask. WebP alpha is kept on both platforms.
+- **Very large or 10-bit HEIC may be refused.** The vendor HEIF decoder rejected a
+  6000×4000 frame (`HeifDecoderImpl: decode: videoFrame is a nullptr`) and a 10-bit
+  payload, while a normal 4032×3024 (12 MP) photo decodes fine. A refused payload
+  surfaces as a rejected promise (`Failed to decode image/heic image: ...`), never as a
+  silently broken page.
+
+Release-build wiring the transcoder needs:
+
+- **Android:** the JNI bridge looks the Kotlin classes up by name, so the library ships
+  `android/consumer-rules.pro` (`consumerProguardFiles`). Without it an R8-enabled
+  host build strips `NitroPdfWriterImageTranscoder` and every transcode reports
+  "not initialized".
+- **iOS:** the decoder registers from `+load` in `ios/NitroPdfWriterImageTranscoder.mm`,
+  and the podspec sets `OTHER_LDFLAGS = -ObjC` on the consuming target so the static
+  framework cannot drop that object file. As a second net, the C++ core calls the
+  registration through a weak symbol before reporting "platform decoder not registered".
 
 > ⚠️ **Important**: Image files must be **local file paths**. Remote URLs are **not supported**.
 
@@ -805,8 +867,8 @@ await pdf.freeMedia(logo);
 
 | Load API | Source | Notes |
 |----------|--------|-------|
-| `loadImageFromFile(fileName, useCache?)` | file → buffer | PNG/JPEG auto-detected from extension |
-| `loadImageFromBuffer(buffer, format, width, height, colorSpace, useCache?)` | buffer | `format`: `'png' \| 'jpeg' \| 'raw'` |
+| `loadImageFromFile(fileName, useCache?)` | file → buffer | Container sniffed from magic bytes; `.png`/`.jpg`/`.jpeg`/`.heic`/`.heif`/`.webp`/`.avif` |
+| `loadImageFromBuffer(buffer, format, width, height, colorSpace, useCache?)` | buffer | `format`: `'png' \| 'jpeg' \| 'raw' \| 'heic' \| 'heif' \| 'webp' \| 'avif'` (a hint; bytes decide) |
 | `loadFontFromFile(fileName, faceIndex?)` | file → buffer | TTC index + glyph metrics pre-parsed |
 | `loadFontFromBuffer(buffer, faceIndex?)` | buffer | Materializes a temp file for libharu |
 
@@ -871,8 +933,8 @@ The media cache stores **document-independent** prepared data so repeated loads 
 
 | Cached payload | Shared across documents? | Notes |
 |----------------|--------------------------|-------|
-| Font file bytes + glyph metrics + TTC face index | Yes (the pre-parse) | `HPDF_Font` itself is document-bound and is **not** shared |
-| Image source bytes (PNG/JPEG/raw) | Yes | Installed per document via `*FromMem` |
+| Font file bytes + glyph metrics + TTC face index | Yes (the pre-parse) | `HPDF_Font` itself is document-bound and is **not** shared. On a disk-cache hit only the bytes survive; metrics and the load path are re-derived before the blob is attachable |
+| Image bytes (PNG/JPEG/raw, or transcoded HEIC/WebP) | Yes | Installed per document via `*FromMem`. PNG/JPEG headers are re-parsed and raw geometry is restored on a disk hit; HEIC/WebP are stored **already transcoded**, so a cold start never re-decodes the photo |
 
 > ⚠️ **Do not over-use the cache.** It is designed for assets you actually reuse across
 > multiple PDF documents (letterhead logos, CJK fonts, shared photos). Caching one-off
@@ -911,13 +973,18 @@ that work is pure CPU/IO and is identical for every document.
 
 ### Limits and eviction
 
-- Hard cap on **total payload bytes** (default **32 MiB**).
-- **LRU** eviction among unpinned entries.
-- Entries are **reference-counted**: `get()` pins, dropping the result unpins. Pinned entries are never evicted mid-use.
+The cache is two layers with independent budgets:
+
+- **Memory**: hard cap on total payload bytes (default **32 MiB**), **LRU** eviction among
+  unpinned entries, **reference-counted** — `get()` pins, dropping the result unpins, and pinned
+  entries are never evicted mid-use.
+- **Disk** (when `cacheDir` is set): separate budget (default **128 MiB**), pruned oldest-first
+  on its own schedule. Memory eviction never grows the disk layer, so a long-running app does
+  not accumulate `.bin`/`.key` files forever.
 
 ```typescript
-await pdf.setMediaCacheLimit(16 * 1024 * 1024); // 16 MiB
-const stats = await pdf.getMediaCacheStats();   // { entries, totalBytes, maxBytes }
+await pdf.setMediaCacheLimit(16 * 1024 * 1024); // 16 MiB in-memory cap
+const stats = await pdf.getMediaCacheStats();   // { entries, totalBytes, maxBytes, diskBytes, maxDiskBytes }
 await pdf.clearMediaCache();                    // release everything (memory + disk)
 ```
 
@@ -1307,7 +1374,20 @@ yarn test
 
 # C++ unit tests
 yarn test:cpp
+
+# Android: JVM unit tests (transcode policy: API gating, subsampling, sizing)
+# Android: on-device tests (real HEIC/WebP decoding, run from a host app project)
+./gradlew :react-native-nitro-pdf-writer:testDebugUnitTest
+./gradlew :react-native-nitro-pdf-writer:connectedDebugAndroidTest
+
+# iOS: run the real ImageIO transcode path inside an iOS Simulator
+scripts/test-ios-sim-transcode.sh
 ```
+
+`scripts/test-ios-sim-transcode.sh` compiles `ios/NitroPdfWriterImageTranscoder.mm`
+plus the core into a small simulator binary (no Xcode project, no RN build) and
+runs it through `simctl spawn` against the same HEIC/WebP fixtures the Android
+instrumentation tests use.
 
 C++ coverage includes the two-step load / attach pipeline (`cpp/tests/test_load_attach.cpp`):
 
@@ -1324,7 +1404,7 @@ Also covered: `MediaCache` LRU + byte cap + pin/refcount, `FontPrep` TTC index &
 ## Dependencies
 
 - [libharu](https://github.com/libharu/libharu) — open-source PDF generation library
-- [libpng](http://www.libpng.org/pub/png/libpng.html) — PNG image support (bundled for both iOS and Android)
+- [libpng](http://www.libpng.org/pub/png/libpng.html) — PNG image support (vendored under `thirdparty/libpng`, compiled from source on both iOS and Android)
 - [react-native-nitro-modules](https://github.com/mrousavy/react-native-nitro-modules) — fast native bindings for React Native
 
 ## Resources

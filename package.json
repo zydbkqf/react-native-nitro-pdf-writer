@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-pdf-writer",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Fast PDF file writing for React Native using libHaru and Nitro Modules",
   "license": "MIT",
   "homepage": "https://github.com/zydbkqf/react-native-nitro-pdf-writer",
@@ -13,9 +13,9 @@
     "npw-subset-font": "scripts/subset-font.js"
   },
   "scripts": {
-    "postinstall": "node scripts/prepare-libharu.js",
     "specs": "nitrogen",
     "npw-subset-font": "node scripts/subset-font.js",
+    "vendor:update": "node scripts/update-vendored-deps.js",
     "test": "jest",
     "test:cpp": "node scripts/test-cpp.js"
   },
@@ -40,6 +40,9 @@
     "!src/__tests__",
     "cpp",
     "!cpp/tests",
+    "thirdparty/libharu/src",
+    "thirdparty/libharu/include",
+    "thirdparty/libpng",
     "android",
     "ios",
     "scripts",
